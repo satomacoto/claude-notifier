@@ -22,5 +22,16 @@
     <false/>
     <key>NSUserNotificationAlertStyle</key>
     <string>alert</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.satomacoto.claude-notifier</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>claude-notifier</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

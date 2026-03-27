@@ -25,11 +25,19 @@ func focusTerminal(terminalType: String, itermSession: String?) {
             NSWorkspace.shared.open(itermURL)
         }
         if let session = itermSession, !session.isEmpty {
-            // Resolve it2 from $PATH
+            // Resolve it2 from $PATH + common user paths
             let env = ProcessInfo.processInfo.environment
-            let path = env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin"
+            let basePath = env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin"
+            let homedir = env["HOME"] ?? NSHomeDirectory()
+            let extraPaths = [
+                "\(homedir)/.local/bin",
+                "\(homedir)/.cargo/bin",
+                "/usr/local/bin",
+                "/opt/homebrew/bin"
+            ]
+            let allDirs = basePath.split(separator: ":").map(String.init) + extraPaths
             var it2Path: String?
-            for dir in path.split(separator: ":") {
+            for dir in allDirs {
                 let candidate = "\(dir)/it2"
                 if FileManager.default.isExecutableFile(atPath: candidate) {
                     it2Path = candidate

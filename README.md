@@ -1,57 +1,66 @@
 # claude-notifier
 
-macOS native notification sender for Claude Code, with terminal-aware tap-to-focus.
+macOS native notification daemon for Claude Code, with terminal-aware tap-to-focus.
+
+Runs as a resident background app. Claude Code hooks send notifications via custom URL scheme — no process spawning per notification.
 
 ## Prerequisites
 
 - **macOS** (uses NSUserNotificationCenter)
-- **Swift** compiler (`swiftc`) - included with Xcode Command Line Tools
-- **jq** - for parsing hook input (`brew install jq`)
-- **it2** - for iTerm2 tab focus (`uv tool install it2`)
-- **iTerm2 Python API** - Enable in iTerm2 > Settings > General > Magic > "Enable Python API"
+- **Swift** compiler (`swiftc`) — included with Xcode Command Line Tools
+- **jq** — for parsing hook input (`brew install jq`)
+- **python3** — for URL encoding in hook command
+- **it2** — for iTerm2 tab focus (`uv tool install it2`)
 
-## macOS permissions
+## macOS Permissions
 
-The following permissions must be enabled in **System Settings**:
+1. **Privacy & Security > App Management** — Allow `claude-notifier.app`
+2. **Notifications** — Allow notifications from `claude-notifier` (System Settings > Notifications)
 
-1. **Privacy & Security > App Management** - Allow `claude-notifier.app` (required for tap-to-focus)
-2. **Notifications** - Allow notifications from `claude-notifier` (System Settings > Notifications)
-
-## Build
+## Build & Install
 
 ```bash
 ./build.sh
+cp -r build/claude-notifier.app ~/Applications/
 ```
 
-## Install
+First launch to register the URL scheme:
 
 ```bash
-cp -r build/claude-notifier.app ~/Applications/
+open ~/Applications/claude-notifier.app
 ```
 
 ## Usage
 
+Send notifications via URL scheme:
+
 ```bash
 # Basic
-claude-notifier --message "Ready"
+open "claude-notifier://notify?message=Hello"
 
-# With sound
-claude-notifier --title "Claude Code" --message "Ready" --sound Ping
+# With title and sound
+open "claude-notifier://notify?title=MyProject&message=Ready&sound=Ping"
 
-# With iTerm2 session (for tap-to-focus)
-claude-notifier --message "Ready" --sound Ping --iterm-session "$(it2 session get-var id)"
+# With iTerm2 tab focus
+open "claude-notifier://notify?title=MyProject&message=Ready&sound=Ping&terminal=iterm2&session=SESSION_ID"
+
+# Quit the app
+open "claude-notifier://quit"
 ```
 
-### CLI Arguments
+### URL Parameters
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--title` | No | `Claude Code — {project}` | Notification title (`{project}` = basename of `$PWD`) |
-| `--message` | No | Read from stdin | Notification body |
-| `--sound` | No | None | Sound name (e.g. `Ping`, `Glass`, `Submarine`) |
-| `--iterm-session` | No | None | iTerm2 session ID from `it2 session get-var id` |
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `title` | No | `Claude Code` | Notification title |
+| `message` | No | (empty) | Notification body |
+| `sound` | No | None | Sound name (e.g. `Ping`, `Glass`, `Submarine`) |
+| `terminal` | No | `unknown` | Terminal type: `iterm2`, `vscode`, `terminal` |
+| `session` | No | None | iTerm2 session ID for tab-level focus |
 
-## Claude Code hooks integration
+All values must be URL-encoded.
+
+## Claude Code Hooks Integration
 
 Add to `~/.claude/settings.json`:
 
@@ -74,7 +83,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MSG=$(cat | jq -r '.message // \"Claude Code is ready\"') && SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null) && PROJECT=$(basename \"$PWD\") && ~/Applications/claude-notifier.app/Contents/MacOS/claude-notifier --title \"Claude Code — $PROJECT\" --message \"$MSG\" --sound Ping --iterm-session \"$SID\" &"
+            "command": "MSG=$(cat | jq -r '.message // \"Claude Code is ready\"') && SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null || echo '') && PROJECT=$(basename \"$PWD\") && MSG_ENC=$(python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$MSG\") && TITLE_ENC=$(python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$PROJECT\") && open \"claude-notifier://notify?title=$TITLE_ENC&message=$MSG_ENC&sound=Ping&terminal=iterm2&session=$SID\""
           }
         ]
       }
@@ -83,9 +92,9 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-## Tap-to-focus
+## Tap-to-Focus
 
-Tapping the notification activates the terminal where Claude Code is running:
+Tapping a notification activates the originating terminal:
 
 | Terminal | Behavior |
 |----------|----------|
@@ -93,3 +102,11 @@ Tapping the notification activates the terminal where Claude Code is running:
 | VS Code | Activates VS Code |
 | Terminal.app | Activates Terminal.app |
 | Other | Notification only |
+
+## Architecture
+
+- **Resident background app** — launches once, stays alive via `NSApplication.run()`
+- **Custom URL scheme** (`claude-notifier://`) — IPC from hooks to app
+- **LSUIElement=true** — no Dock icon, no menu bar
+- **One notification per session** — same-tab notifications replace each other (sound always replays)
+- **Ad-hoc codesigned** — no Xcode project, builds with `swiftc` only

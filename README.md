@@ -36,13 +36,13 @@ Send notifications via URL scheme:
 
 ```bash
 # Basic
-open "claude-notifier://notify?message=Hello"
+open --background "claude-notifier://notify?message=Hello"
 
 # With title and sound
-open "claude-notifier://notify?title=MyProject&message=Ready&sound=Ping"
+open --background "claude-notifier://notify?title=MyProject&message=Ready&sound=Ping"
 
 # With iTerm2 tab focus
-open "claude-notifier://notify?title=MyProject&message=Ready&sound=Ping&terminal=iterm2&session=SESSION_ID"
+open --background "claude-notifier://notify?title=MyProject&message=Ready&sound=Ping&terminal=iterm2&session=SESSION_ID"
 
 # Quit the app
 open "claude-notifier://quit"

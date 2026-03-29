@@ -11,6 +11,9 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 echo "==> Cleaning build directory..."
 rm -rf "$APP_DIR"
 
+echo "==> Regenerating icon assets..."
+swift "$SCRIPT_DIR/generate_app_icon.swift"
+
 echo "==> Creating app bundle structure..."
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 

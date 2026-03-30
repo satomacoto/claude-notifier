@@ -5,8 +5,12 @@ import ServiceManagement
 
 let availableSounds = ["", "Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero",
                        "Morse", "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink"]
+// Sounds used for automatic per-project assignment (excluding "" and common defaults)
+let projectSounds = ["Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero",
+                     "Morse", "Pop", "Purr", "Sosumi", "Submarine", "Tink"]
 
 let defaultsKeySound = "defaultSound"
+let defaultsKeyPerProjectSound = "perProjectSound"
 
 // MARK: - URL Query Parsing
 
@@ -585,6 +589,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         soundItem.submenu = soundMenu
         menu.addItem(soundItem)
 
+        // Per-project sound
+        let perProjectItem = NSMenuItem(title: "Per-Project Sound", action: #selector(togglePerProjectSound(_:)), keyEquivalent: "")
+        perProjectItem.target = self
+        perProjectItem.state = UserDefaults.standard.bool(forKey: defaultsKeyPerProjectSound) ? .on : .off
+        menu.addItem(perProjectItem)
+
         menu.addItem(NSMenuItem.separator())
 
         // Launch at Login
@@ -612,6 +622,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         UserDefaults.standard.set(sound, forKey: defaultsKeySound)
+        statusItem.menu = buildMenu()
+    }
+
+    @objc func togglePerProjectSound(_ sender: NSMenuItem) {
+        let newState = !UserDefaults.standard.bool(forKey: defaultsKeyPerProjectSound)
+        UserDefaults.standard.set(newState, forKey: defaultsKeyPerProjectSound)
         statusItem.menu = buildMenu()
     }
 
@@ -687,7 +703,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notification.informativeText = params["message"] ?? ""
 
         // URL param overrides default; fall back to user preference
-        let soundName = params["sound"] ?? UserDefaults.standard.string(forKey: defaultsKeySound) ?? ""
+        // Sound priority: URL param > per-project auto-assign (if enabled) > user default
+        let soundName: String
+        if let explicit = params["sound"], !explicit.isEmpty {
+            soundName = explicit
+        } else if UserDefaults.standard.bool(forKey: defaultsKeyPerProjectSound) {
+            let hash = abs(projectName.hashValue)
+            soundName = projectSounds[hash % projectSounds.count]
+        } else {
+            soundName = UserDefaults.standard.string(forKey: defaultsKeySound) ?? ""
+        }
         if !soundName.isEmpty {
             notification.soundName = soundName
         }

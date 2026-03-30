@@ -1,3 +1,7 @@
 .DS_Store
 build/
 icon.iconset/
+AppIcon.icns
+AppIcon.iconset/
+Resources/menubar_icon.png
+Resources/menubar_icon@2x.png

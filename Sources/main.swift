@@ -262,6 +262,30 @@ private func readVarint(_ data: Data, offset: Int) -> (UInt64, Int)? {
     return nil
 }
 
+/// Extract the first varint value for a given field number from a protobuf message.
+private func extractVarint(_ data: Data, fieldNumber: Int) -> UInt64? {
+    var i = data.startIndex
+    while i < data.endIndex {
+        guard let (tag, tagLen) = readVarint(data, offset: i) else { break }
+        let fnum = Int(tag >> 3)
+        let wtype = Int(tag & 0x07)
+        i += tagLen
+        switch wtype {
+        case 0:
+            guard let (val, vLen) = readVarint(data, offset: i) else { return nil }
+            if fnum == fieldNumber { return val }
+            i += vLen
+        case 2:
+            guard let (length, lLen) = readVarint(data, offset: i) else { return nil }
+            i += lLen + Int(length)
+        case 1: i += 8
+        case 5: i += 4
+        default: return nil
+        }
+    }
+    return nil
+}
+
 /// Extract all string values for a given field number from a protobuf message.
 private func extractStrings(_ data: Data, fieldNumber: Int) -> [String] {
     var results: [String] = []
@@ -354,8 +378,16 @@ private func readWebSocketPayload(_ fd: Int32, timeoutSecs: Int = 3) -> Data? {
     return payload
 }
 
-/// Find the iTerm2 tab_id for a tmux window by querying ListSessions.
-func iterm2FindTabForTmuxWindow(_ tmuxWindowID: String, fd: Int32) -> String? {
+/// Result of looking up a tmux window in ListSessions.
+struct TabLookupResult {
+    let tabID: String
+    let tabIndex: Int      // 0-based position within window
+    let windowNumber: Int  // Window.number field
+    let totalWindows: Int  // total number of windows
+}
+
+/// Find the iTerm2 tab for a tmux window by querying ListSessions.
+func iterm2FindTabForTmuxWindow(_ tmuxWindowID: String, fd: Int32) -> TabLookupResult? {
     let msg = buildListSessionsMessage()
     guard websocketSendBinary(fd, msg) else { return nil }
     guard let payload = readWebSocketPayload(fd) else { return nil }
@@ -363,36 +395,67 @@ func iterm2FindTabForTmuxWindow(_ tmuxWindowID: String, fd: Int32) -> String? {
     // ServerOriginatedMessage → list_sessions_response (field 106)
     guard let listResp = extractMessages(payload, fieldNumber: 106).first else { return nil }
 
-    // ListSessionsResponse → windows (field 1) → tabs (field 1)
-    for window in extractMessages(listResp, fieldNumber: 1) {
-        for tab in extractMessages(window, fieldNumber: 1) {
+    let windows = extractMessages(listResp, fieldNumber: 1)
+
+    for window in windows {
+        let windowNumber = Int(extractVarint(window, fieldNumber: 4) ?? 0)
+        let tabs = extractMessages(window, fieldNumber: 1)
+        for (tabIndex, tab) in tabs.enumerated() {
             let tmuxIds = extractStrings(tab, fieldNumber: 4)
             if tmuxIds.contains(tmuxWindowID) {
-                return extractStrings(tab, fieldNumber: 2).first
+                guard let tabID = extractStrings(tab, fieldNumber: 2).first else { continue }
+                return TabLookupResult(
+                    tabID: tabID,
+                    tabIndex: tabIndex,
+                    windowNumber: windowNumber,
+                    totalWindows: windows.count
+                )
             }
         }
     }
     return nil
 }
 
+/// Build a keyboard shortcut string like "⌘3" from tab lookup result.
+func shortcutString(from result: TabLookupResult) -> String? {
+    let tabNum = result.tabIndex + 1
+    guard tabNum <= 9 else { return nil }
+    return "⌘\(tabNum)"
+}
+
 /// Focus an iTerm2 tmux window by looking up the tab via ListSessions, then activating it.
-func iterm2FocusTmuxWindow(_ tmuxWindowID: String) -> Bool {
+/// Returns the keyboard shortcut string (e.g. "⌘3") on success.
+func iterm2FocusTmuxWindow(_ tmuxWindowID: String) -> String? {
     // Strip "@" prefix if present (tmux uses @N, iTerm2 API uses just N)
     let winID = tmuxWindowID.hasPrefix("@") ? String(tmuxWindowID.dropFirst()) : tmuxWindowID
 
     let path = iterm2SocketPath()
     guard FileManager.default.fileExists(atPath: path),
-          let fd = connectUDS(path) else { return false }
+          let fd = connectUDS(path) else { return nil }
     defer { Darwin.close(fd) }
 
-    guard websocketHandshake(fd) else { return false }
+    guard websocketHandshake(fd) else { return nil }
 
-    guard let tabID = iterm2FindTabForTmuxWindow(winID, fd: fd) else { return false }
+    guard let result = iterm2FindTabForTmuxWindow(winID, fd: fd) else { return nil }
 
-    let msg = buildActivateTabMessage(tabID: tabID)
-    guard websocketSendBinary(fd, msg) else { return false }
+    let msg = buildActivateTabMessage(tabID: result.tabID)
+    guard websocketSendBinary(fd, msg) else { return nil }
     _ = readWebSocketPayload(fd)
-    return true
+    return shortcutString(from: result)
+}
+
+/// Query tab position for a tmux window without activating (for notification display).
+func iterm2LookupShortcut(tmuxWindowID: String) -> String? {
+    let winID = tmuxWindowID.hasPrefix("@") ? String(tmuxWindowID.dropFirst()) : tmuxWindowID
+
+    let path = iterm2SocketPath()
+    guard FileManager.default.fileExists(atPath: path),
+          let fd = connectUDS(path) else { return nil }
+    defer { Darwin.close(fd) }
+
+    guard websocketHandshake(fd) else { return nil }
+    guard let result = iterm2FindTabForTmuxWindow(winID, fd: fd) else { return nil }
+    return shortcutString(from: result)
 }
 
 // MARK: - Terminal Focus
@@ -408,7 +471,7 @@ func focusTerminal(terminalType: String, itermSession: String?, tmuxWindowID: St
     switch terminalType {
     case "iterm2":
         // 1) tmux integration → ListSessions to find matching tab, then Activate
-        if let twID = tmuxWindowID, !twID.isEmpty, iterm2FocusTmuxWindow(twID) {
+        if let twID = tmuxWindowID, !twID.isEmpty, iterm2FocusTmuxWindow(twID) != nil {
             activateApp(bundleID: "com.googlecode.iterm2")
             return
         }
@@ -591,7 +654,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let notification = NSUserNotification()
         // Use session ID as identifier so same-tab notifications replace each other
         notification.identifier = params["session"] ?? UUID().uuidString
-        notification.title = params["title"] ?? "Claude Code"
+
+        let projectName = params["title"] ?? "Claude Code"
+        let terminal = params["terminal"] ?? "unknown"
+        var terminalName: String?
+        var shortcut: String?
+
+        switch terminal {
+        case "iterm2":
+            terminalName = "iTerm"
+            if let twID = params["tmux_window_id"], !twID.isEmpty {
+                shortcut = iterm2LookupShortcut(tmuxWindowID: twID)
+            }
+        case "vscode":
+            terminalName = "VS Code"
+        case "terminal":
+            terminalName = "Terminal"
+        default:
+            break
+        }
+
+        // Format: "ProjectName ⌘3 — iTerm" or "ProjectName — VS Code" or just "ProjectName"
+        if let tn = terminalName {
+            if let sc = shortcut {
+                notification.title = "\(projectName) \(sc) — \(tn)"
+            } else {
+                notification.title = "\(projectName) — \(tn)"
+            }
+        } else {
+            notification.title = projectName
+        }
         notification.informativeText = params["message"] ?? ""
 
         // URL param overrides default; fall back to user preference
@@ -601,7 +693,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         var userInfo: [String: Any] = [
-            "terminalType": params["terminal"] ?? "unknown"
+            "terminalType": terminal
         ]
         if let session = params["session"], !session.isEmpty {
             userInfo["itermSession"] = session

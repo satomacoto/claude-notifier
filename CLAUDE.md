@@ -17,18 +17,26 @@ Build uses `swiftc` directly (no Xcode project, no Swift Package Manager). Ad-ho
 
 ## Architecture
 
-- **Sources/main.swift** — entire app: CLI arg parsing, `NSUserNotification` delivery, tap-to-focus delegate, 30s auto-exit. Uses `NSUserNotificationCenter` (not `UNUserNotificationCenter`).
-- **Resources/focus_iterm.py** — Python script using `iterm2` package to focus a specific iTerm2 session. Currently unused at runtime (the app calls `it2` CLI instead), but bundled in the app.
+- **Sources/main.swift** — entire app: URL scheme handler, `NSUserNotification` delivery, tap-to-focus delegate, menu bar status item. Uses `NSUserNotificationCenter` (not `UNUserNotificationCenter`).
 - **build.sh** — compiles Swift, assembles `.app` bundle (Contents/MacOS + Info.plist + Resources), ad-hoc codesigns.
 - **Info.plist** — `LSUIElement=true` (no Dock icon), `NSUserNotificationAlertStyle=alert`.
 
 ## Key Design Decisions
 
 - Terminal type is detected from env vars (`ITERM_SESSION_ID`, `TERM_PROGRAM`) at notification-send time and stored in `notification.userInfo` so the tap handler has context even if relaunched.
-- iTerm2 session focus uses the `it2` CLI tool (hardcoded path `/Users/sato/.local/bin/it2`), not the bundled Python script.
-- The app runs as an accessory app (`.accessory` activation policy) — no Dock icon, no menu bar.
-- Each invocation sends one notification and exits (after tap or 30s timeout).
+- **iTerm2 session focus uses iTerm2's native API directly** — WebSocket + Protocol Buffers over Unix domain socket (`~/Library/Application Support/iTerm2/private/socket`). No external dependencies (no `it2` CLI, no Python, no iterm2 package).
+  - **Non-tmux**: sends `ActivateRequest` with `session_id` (UUID extracted from `ITERM_SESSION_ID`).
+  - **tmux integration**: sends `ListSessionsRequest` to find the tab matching `tmux_window_id`, then sends `ActivateRequest` with `tab_id`.
+- Protobuf encoding/decoding is hand-rolled (minimal subset) to avoid SwiftProtobuf dependency.
+- The app runs as a resident menu bar app (`.accessory` activation policy) — no Dock icon.
+
+## URL Scheme
+
+`claude-notifier://notify?title=...&message=...&terminal=iterm2&session=<ITERM_SESSION_ID>&tmux_window_id=<@N>`
+
+- `session` — iTerm2 session ID (for non-tmux)
+- `tmux_window_id` — tmux window ID like `@4` (for tmux integration; `@` prefix is stripped automatically)
 
 ## Integration
 
-Used as a Claude Code hook via `open ~/Applications/claude-notifier.app --args ...`. The hook captures iTerm2 session ID at `SessionStart` and pipes notification JSON through `jq` at `Notification` time. See README.md for the full hooks config.
+Used as a Claude Code hook via URL scheme. The hook captures iTerm2 session ID and tmux window ID at `SessionStart` and opens the URL scheme at `Notification` time. See README.md for the full hooks config.

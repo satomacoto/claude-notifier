@@ -466,8 +466,13 @@ func iterm2LookupShortcut(tmuxWindowID: String) -> String? {
 
 /// Bring an app to the foreground by bundle identifier.
 func activateApp(bundleID: String) {
-    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
-        app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        // Use AppleScript as NSRunningApplication.activate is unreliable on macOS 14+
+        let script = NSAppleScript(source: """
+            tell application id "\(bundleID)" to activate
+        """)
+        var error: NSDictionary?
+        script?.executeAndReturnError(&error)
     }
 }
 
@@ -669,7 +674,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let notification = NSUserNotification()
         // Use session ID as identifier so same-tab notifications replace each other
-        notification.identifier = params["session"] ?? UUID().uuidString
+        // Use tmux_window_id or session as identifier so each tab gets its own notification
+        notification.identifier = params["tmux_window_id"] ?? params["session"] ?? UUID().uuidString
 
         let projectName = params["title"] ?? "Claude Code"
         let terminal = params["terminal"] ?? "unknown"
@@ -690,10 +696,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
 
-        // Format: "ProjectName ⌘3 — iTerm" or "ProjectName — VS Code" or just "ProjectName"
+        // Format: "⌘3 ProjectName — iTerm" or "ProjectName — VS Code" or just "ProjectName"
         if let tn = terminalName {
             if let sc = shortcut {
-                notification.title = "\(projectName) \(sc) — \(tn)"
+                notification.title = "\(sc) \(projectName) — \(tn)"
             } else {
                 notification.title = "\(projectName) — \(tn)"
             }

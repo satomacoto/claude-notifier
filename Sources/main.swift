@@ -791,8 +791,10 @@ final class NotificationStore {
             // routing metadata like tabId/shortcut wins), mark unread, float to top,
             // and bump the repeat count so stacked notifications are visible as ×N.
             var updated = item
+            // Reset the stack count once the row was read/acknowledged; otherwise keep
+            // counting the current unread streak.
+            updated.count = items[i].read ? 1 : items[i].count + 1
             updated.read = false
-            updated.count = items[i].count + 1
             items.remove(at: i)
             items.insert(updated, at: 0)
         } else {
@@ -910,8 +912,9 @@ final class NotificationRowView: NSView {
         meta.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         var titleViews: [NSView] = [title]
-        if item.count > 1 {
-            titleViews.append(makeCountBadge(item.count, color: dimmed ? .tertiaryLabelColor : item.status.color))
+        // Show the ×N stack count only while unread; reading the row clears it.
+        if item.count > 1 && !dimmed {
+            titleViews.append(makeCountBadge(item.count, color: item.status.color))
         }
         titleViews.append(meta)
         let titleRow = NSStackView(views: titleViews)
@@ -1021,6 +1024,11 @@ final class NotificationRowView: NSView {
         if dismissButton.bounds.contains(pInBtn) { return dismissButton }
         return self
     }
+
+    // Act on the very first click even when the window is inactive (common with Always on
+    // Top, where the window floats but keyboard focus stays in the terminal). Without this,
+    // the first click would only activate the window and the notification wouldn't open.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { return true }
 
     override func mouseDown(with event: NSEvent) {
         // Claim the event so mouseUp is delivered here, even if the list rebuilds in between.

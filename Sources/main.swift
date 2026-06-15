@@ -772,6 +772,7 @@ struct NotificationItem {
     var date: Date
     var read: Bool            // false = pending (unread); true = acted/auto-read history
     var count: Int = 1        // how many times this tab has notified (shown as ×N when > 1)
+    var source: String? = nil // which message source the hook used: recap / title / alert
 }
 
 /// In-memory inbox. Newest item first. `onChange` fires after any mutation.
@@ -900,6 +901,7 @@ final class NotificationRowView: NSView {
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         var metaParts: [String] = []
+        if let src = item.source, !src.isEmpty { metaParts.append(src) }
         if let sc = item.shortcut { metaParts.append(sc) }
         if let tn = item.terminalName { metaParts.append(tn) }
         metaParts.append(relativeTimeString(item.date))
@@ -925,9 +927,8 @@ final class NotificationRowView: NSView {
         let message = NSTextField(wrappingLabelWithString: item.message)
         message.font = .systemFont(ofSize: 11)
         message.textColor = dimmed ? .tertiaryLabelColor : .secondaryLabelColor
-        message.maximumNumberOfLines = 2
-        message.lineBreakMode = .byTruncatingTail
-        message.cell?.truncatesLastVisibleLine = true
+        message.maximumNumberOfLines = 0          // show the full message; the row grows to fit
+        message.lineBreakMode = .byWordWrapping
         message.preferredMaxLayoutWidth = max(120, width - 64)
         message.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         message.isHidden = item.message.isEmpty
@@ -1648,7 +1649,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             message: messageText,
             status: status,
             date: Date(),
-            read: false
+            read: false,
+            source: params["source"].flatMap { $0.isEmpty ? nil : $0 }
         ))
         // Visual arrival cue is the Dock badge (updated via store.onChange → updateBadge);
         // no Dock bounce, which the user found too noisy.

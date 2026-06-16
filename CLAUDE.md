@@ -31,16 +31,30 @@ Build uses `swiftc` directly (no Xcode project, no Swift Package Manager). Ad-ho
 - The app runs as a resident regular app (`.regular` activation policy, Dock icon). `applicationShouldTerminateAfterLastWindowClosed` returns false and `applicationShouldHandleReopen` reopens the window, so closing the window keeps the notifier alive in the background.
 - Notifications are kept until acted on or dismissed (acted-on ones stay as dimmed read history); a `FocusMonitor` watches the active iTerm2 session/tab and auto-marks the matching pending notification read. The Dock badge shows the unread count.
 - tmux notifications intentionally store `sessionUUID = nil` (matched by resolved `tabId` only), because a tmux session id is shared across windows and matching by session would wrongly clear other windows' notifications.
+- **Persistence**: `NotificationStore` is `Codable` and saved (debounced + atomic, plus a synchronous flush in `applicationWillTerminate`) to `~/Library/Application Support/claude-notifier/inbox.json`, restored via `load()` on launch. A corrupt file is moved aside (`.corrupt-<ts>`). `NotificationItem`'s decoder is tolerant of missing keys so adding fields never invalidates an existing inbox.
+- **Banner modes** (`bannerMode`, default `transient`): `off` / `transient` (deliver then auto-remove from Notification Center after 5s, so the inbox is the only place notifications accumulate) / `persist` (legacy behavior). Migrates the old `bannerEnabled` bool. `presentBanner()` is the single delivery path (used by both `deliverNotification` and escalation).
+- **Menu-bar status item** (`NSStatusItem`) shows the unread count using the bundled `menubar_icon` (template); `updateBadge()` updates both Dock and menu bar.
+- **Focus-silence**: a notification for the iTerm2 tab/session you're already looking at lands silently as read (`store.add(forceRead:)`), using `activeSessionUUID`/`activeTabId` tracked from `FocusMonitor`.
+- **Quiet hours / DND** (`isQuietNow()`): manual pause (`pauseUntil`) or a nightly window (`quietHoursEnabled`) suppresses banner+sound (inbox still collects).
+- **One-time escalation** (`escalateMinutes`, default off): a 30s timer re-alerts once for an unread review/failed/waiting item past the threshold (`escalated` flag).
+- **Sound**: priority is URL `sound` > per-status (`perStatusSound`, `NotifStatus.defaultSound`) > per-project (`perProjectSound`) > user default.
+- **Webhook** (`webhookURL`): `forwardToWebhook()` POSTs each non-focused, non-muted notification as JSON (fire-and-forget `URLSession`).
+- **One-command setup**: "Install Claude Code Hooks…" merges `sessionStartHookCommand` + `notificationHookCommand` into `~/.claude/settings.json` (idempotent, timestamped backup, confirm-with-preview, refuses non-object files).
+- **Inbox UI extras**: live search + status filter (`InboxRootView` forwards keys), keyboard nav (↑/↓ select, ⏎ open, ⌫ dismiss; id-based selection), compact-row toggle (`compactRows`), and an iTerm2 connection health dot in the header.
 
 ## URL Scheme
 
-`claude-notifier://notify?title=...&message=...&terminal=iterm2&session=<ITERM_SESSION_ID>&tmux_window_id=<@N>&status=<state>`
+`claude-notifier://notify?title=...&message=...&terminal=<type>&session=<ITERM_SESSION_ID>&tmux_window_id=<@N>&tty=<dev>&status=<state>`
 
+- `terminal` — `iterm2`, `vscode`, `terminal`, `ghostty`, `wezterm`, `kitty`, `alacritty`, `warp` (derived from `$TERM_PROGRAM` in the hook). iTerm2 gets tab-level focus; Terminal.app gets tab focus via `tty`; the rest get app-level focus (`terminalBundleIDs`).
 - `session` — iTerm2 session ID (for non-tmux)
 - `tmux_window_id` — tmux window ID like `@4` (for tmux integration; `@` prefix is stripped automatically)
+- `tty` — controlling tty like `/dev/ttys004` (Terminal.app tab focus via AppleScript)
 - `status` — status dot color: `running`, `waiting`, `review` (default), `done`, `failed`, `message`
 - `sound` — optional sound name overriding the user/per-project default
+- `source` — optional meta tag (`recap`/`title`/`alert`)
+- `tool` — optional tool name (e.g. `Bash`) shown in the row meta
 
 ## Integration
 
-Used as a Claude Code hook via URL scheme. The hook captures iTerm2 session ID and tmux window ID at `SessionStart` and opens the URL scheme at `Notification` time. See README.md for the full hooks config.
+Used as a Claude Code hook via URL scheme. The hook captures iTerm2 session ID, `$TERM_PROGRAM`, controlling tty, and tmux window ID at `SessionStart` and opens the URL scheme at `Notification` time. See README.md for the full hooks config, or use the in-app "Install Claude Code Hooks…" menu item.

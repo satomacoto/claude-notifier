@@ -6,12 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A lightweight macOS native notification manager for Claude Code hooks. Single Swift file compiled into a `.app` bundle without Xcode. It is a regular windowed app (Dock icon) whose main window is a scrollable inbox of recent notifications; clicking a row focuses the originating terminal (iTerm2 tab-level, VS Code, Terminal.app). Closing the window keeps the app running in the background; the Dock icon reopens it.
 
-## Build & Install
+## Build & Run
 
 ```bash
-./build.sh                                          # compiles → build/claude-notifier.app
-cp -r build/claude-notifier.app ~/Applications/     # install
+./build.sh                          # compiles → build/claude-notifier.app
+open build/claude-notifier.app      # launch (also registers the URL scheme)
 ```
+
+Run the app from `build/claude-notifier.app` directly. Do **not** also copy it to
+`~/Applications/`: the same bundle id (`com.satomacoto.claude-notifier`) registered at two paths
+makes macOS treat them as separate apps, so a notification (`open claude-notifier://…`) can launch
+a second instance while one is already running. If a stale `~/Applications/` copy exists, remove
+and unregister it (`lsregister -u ~/Applications/claude-notifier.app; rm -rf …; lsregister -f build/claude-notifier.app`).
 
 Build uses `swiftc` directly (no Xcode project, no Swift Package Manager). Ad-hoc codesigned.
 
@@ -39,14 +45,17 @@ Build uses `swiftc` directly (no Xcode project, no Swift Package Manager). Ad-ho
 - **One-time escalation** (`escalateMinutes`, default off): a 30s timer re-alerts once for an unread review/failed/waiting item past the threshold (`escalated` flag).
 - **Sound**: priority is URL `sound` > per-status (`perStatusSound`, `NotifStatus.defaultSound`) > per-project (`perProjectSound`) > user default.
 - **Webhook** (`webhookURL`): `forwardToWebhook()` POSTs each non-focused, non-muted notification as JSON (fire-and-forget `URLSession`).
-- **One-command setup**: "Install Claude Code Hooks…" merges `sessionStartHookCommand` + `notificationHookCommand` into `~/.claude/settings.json` (idempotent, timestamped backup, confirm-with-preview, refuses non-object files).
-- **Inbox UI extras**: live search + status filter (`InboxRootView` forwards keys), keyboard nav (↑/↓ select, ⏎ open, ⌫ dismiss; id-based selection), compact-row toggle (`compactRows`), and an iTerm2 connection health dot in the header.
+- **One-command setup**: "Install Claude Code Hooks…" merges `sessionStartHookCommand` + `notificationHookCommand` + `approvalHookCommand` + `thinkingStartHookCommand` (UserPromptSubmit) + `thinkingStopHookCommand` (Stop/StopFailure) into `~/.claude/settings.json` (idempotent, timestamped backup, confirm-with-preview, refuses non-object files).
+- **Left row indicator**: per-sound SF Symbol (`soundSymbols` keyed by the item's resolved `sound`, tinted by `status.color`), or an `NSProgressIndicator` spinner while `thinking`. Falls back to a colored dot on macOS < 11.
+- **Inbox UI extras**: live search + status filter + **sort selector** (`sortMode`: `recent` default / `project` / `tab`, in the header filter bar). `project` groups by title then orders by tab (⌘N) then recency; `tab` orders by the iTerm shortcut `(window, tab)` with shortcut-less rows last (`tabOrderKey`); `recent` keeps store order. Plus keyboard nav (↑/↓ select, ⏎ open, ⌫ dismiss; id-based selection), compact-row toggle (`compactRows`), and an iTerm2 connection health dot in the header. The header's clear link is **Clear read** (`store.clearRead()` removes acted-on/read rows, keeping pending + thinking; shown only when `store.hasRead`); the full **Clear All** (`store.clearAll()`) lives in the Notifications menu.
 
 ## URL Scheme
 
 `claude-notifier://notify?title=...&message=...&terminal=<type>&session=<ITERM_SESSION_ID>&tmux_window_id=<@N>&tty=<dev>&status=<state>`
 
-- `terminal` — `iterm2`, `vscode`, `terminal`, `ghostty`, `wezterm`, `kitty`, `alacritty`, `warp` (derived from `$TERM_PROGRAM` in the hook). iTerm2 gets tab-level focus; Terminal.app gets tab focus via `tty`; the rest get app-level focus (`terminalBundleIDs`).
+- `terminal` — `iterm2`, `vscode`, `terminal`, `ghostty`, `wezterm`, `kitty`, `alacritty`, `warp` (derived from `$TERM_PROGRAM` in the hook). iTerm2 gets tab-level focus; Terminal.app gets tab focus via `tty`; the rest get app-level focus (`terminalBundleIDs`). **tmux note:** inside tmux `$TERM_PROGRAM=tmux` so the hook sends `terminal=unknown`; both `deliverNotification` and `focusTerminal` normalize `unknown` → `iterm2` when the `session` carries an iTerm session UUID (`extractSessionUUID(s) != s`), so tmux+iTerm2 sessions still resolve the tab shortcut and focus correctly.
+- App-level focus uses `NSWorkspace.openApplication` (LaunchServices), **not** AppleScript — so it needs no Automation (Apple Events / TCC) permission and keeps working across ad-hoc re-signs. Terminal.app per-tab focus still uses AppleScript (needs Automation).
+- **Live ⌘N refresh:** a tab's stored shortcut/`tabId` goes stale when iTerm tabs are reordered/closed (the tmux window id is stable, the position isn't). `refreshTabShortcuts()` (called from `showWindow()` and a 4s timer while the window is visible) does one `iterm2ResolveAllTmuxShortcuts()` ListSessions off the main thread and `store.updateRouting(map)` updates each tmux row's current shortcut/tabId. **Gotcha:** iTerm2's ListSessions returns tmux window ids without the `@` prefix, so `updateRouting` strips `@` before matching the stored `tmux` (e.g. `@50`).
 - `session` — iTerm2 session ID (for non-tmux)
 - `tmux_window_id` — tmux window ID like `@4` (for tmux integration; `@` prefix is stripped automatically)
 - `tty` — controlling tty like `/dev/ttys004` (Terminal.app tab focus via AppleScript)
@@ -54,7 +63,8 @@ Build uses `swiftc` directly (no Xcode project, no Swift Package Manager). Ad-ho
 - `sound` — optional sound name overriding the user/per-project default
 - `source` — optional meta tag (`recap`/`title`/`alert`)
 - `tool` — optional tool name (e.g. `Bash`) shown in the row meta
+- `thinking` — live "Claude is working" state. `start` (with `status=running`) adds a **silent** spinner row for the tab (no banner/sound, excluded from `unreadCount`); `stop` ends it via `store.finishThinking` — the spinner stops and the row stays as quiet, clickable history (`thinking=false`, `read=true`), so you can still jump to the tab; a real notification that arrived mid-turn (no longer thinking) is left as-is. Backed by the `thinking: Bool` field on `NotificationItem` and rendered as an `NSProgressIndicator` spinner in `NotificationRowView`.
 
 ## Integration
 
-Used as a Claude Code hook via URL scheme. The hook captures iTerm2 session ID, `$TERM_PROGRAM`, controlling tty, and tmux window ID at `SessionStart` and opens the URL scheme at `Notification` time. See README.md for the full hooks config, or use the in-app "Install Claude Code Hooks…" menu item.
+Used as a Claude Code hook via URL scheme. The hook captures iTerm2 session ID, `$TERM_PROGRAM`, controlling tty, and tmux window ID at `SessionStart`, opens the URL scheme at `Notification` time, and drives the live thinking indicator via `UserPromptSubmit` (start) + `Stop`/`StopFailure` (stop). `Stop` does not fire on Esc, so `StopFailure` and the `idle_prompt` Notification act as recovery. See README.md for the full hooks config, or use the in-app "Install Claude Code Hooks…" menu item (`installClaudeHooks` upserts all of SessionStart / Notification / PreToolUse / UserPromptSubmit / Stop / StopFailure).

@@ -17,17 +17,25 @@ Runs as a resident app with a notification inbox window and a Dock icon. Claude 
 1. **Privacy & Security > App Management** — Allow `claude-notifier.app`
 2. **Notifications** — Allow notifications from `claude-notifier` (System Settings > Notifications)
 
-## Build & Install
+## Build & Run
 
 ```bash
-./build.sh
-cp -r build/claude-notifier.app ~/Applications/
+./build.sh                          # compiles → build/claude-notifier.app
+open build/claude-notifier.app      # first launch registers the URL scheme
 ```
 
-First launch to register the URL scheme:
+Run the app from `build/claude-notifier.app` directly. Do **not** also copy it to
+`~/Applications/`: the same bundle id registered at two paths makes macOS treat them as separate
+apps, so a notification can launch a second instance while one is already running.
+
+If you previously installed a copy, remove and unregister it so the URL scheme resolves to a
+single handler:
 
 ```bash
-open ~/Applications/claude-notifier.app
+lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$lsregister" -u ~/Applications/claude-notifier.app
+rm -rf ~/Applications/claude-notifier.app
+"$lsregister" -f "$PWD/build/claude-notifier.app"
 ```
 
 ## Usage
@@ -65,6 +73,7 @@ open "claude-notifier://quit"
 | `source` | No | None | Optional tag shown in the row's meta line (e.g. `recap`, `title`, `alert`) to mark which message source was used |
 | `tty` | No | None | Controlling tty (e.g. `/dev/ttys004`) for Terminal.app tab-level focus |
 | `tool` | No | None | Tool that triggered the prompt (e.g. `Bash`); shown in the row's meta line |
+| `thinking` | No | None | Live "Claude is working" state: `start` shows a silent spinner row for the tab (never banners/sounds, not counted as unread); `stop` stops the spinner and keeps the row as quiet, clickable history (a real notification that arrived mid-turn is left as-is) |
 
 All values must be URL-encoded. Use `open -g` to avoid stealing focus from the current app.
 
@@ -95,21 +104,65 @@ Add to `~/.claude/settings.json`:
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null||echo ''); TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null||echo \"$TERM_PROGRAM\"); TAPP=$(case \"$TPROG\" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac); PROJECT=$(basename \"$(git -C \"$PWD\" rev-parse --show-toplevel 2>/dev/null||echo \"$PWD\")\"); ENC(){ python3 -c \"import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?title=$(ENC \"$PROJECT\")&terminal=$TAPP&session=$SID&tmux_window_id=$(ENC \"$TWID\")&tty=$(ENC \"$TTY\")&status=running&thinking=start\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); ENC(){ python3 -c \"import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?session=$SID&tmux_window_id=$(ENC \"$TWID\")&thinking=stop\""
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); ENC(){ python3 -c \"import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?session=$SID&tmux_window_id=$(ENC \"$TWID\")&thinking=stop\""
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
+The `UserPromptSubmit` / `Stop` / `StopFailure` hooks drive the live **thinking** indicator: a
+prompt submission lights a silent spinner row for that tab, and the end of the turn clears it.
+`StopFailure` (and the `idle_prompt` Notification) recover the state if a turn is interrupted,
+since `Stop` does not fire on Esc.
+
 ## Notification Inbox
 
-The main window is a scrollable inbox of recent notifications. Each row shows a colored
-status dot, the project name, the terminal and tab shortcut, a relative time, and the message.
+The main window is a scrollable inbox of recent notifications. Each row shows a left indicator,
+the project name, the terminal and tab shortcut, a relative time, and the message.
 
 - **Click a row** to focus the terminal that sent it (the row is then marked read).
-- **Press ×** on a row to dismiss just that one, or **Clear all** in the header.
-- **Status dot** color reflects why the notification fired. The provided hook maps Claude
-  Code's `notification_type` to `status=`: a permission prompt shows orange (`review`), an
-  idle/input prompt shows gray (`waiting`), a successful auth shows green (`done`).
+- **Press ×** on a row to dismiss just that one, or **Clear read** in the header to clear the
+  acted-on history (keeps pending and in-progress rows). **Clear All** is in the Notifications menu.
+- **Left indicator.** Normally an SF Symbol icon for the notification's sound (so the same
+  project shows the same icon when Per-Project Sound is on), tinted by the status color. While
+  Claude is mid-turn the indicator is a small spinner (see **Live thinking indicator** below).
+  The color reflects why the notification fired: the provided hook maps Claude Code's
+  `notification_type` to `status=` (permission prompt = orange `review`, idle/input prompt =
+  gray `waiting`, successful auth = green `done`).
+- **Live thinking indicator.** With the `UserPromptSubmit` / `Stop` hooks installed, a tab shows
+  a silent spinner row the moment you submit a prompt; when the turn ends the spinner stops and
+  the row stays as quiet, clickable history (so you can still jump to that tab). You can see at a
+  glance which tabs are still working vs done. Thinking rows never banner, sound, or count toward
+  the unread badge, and clicking one focuses its tab without dismissing it.
 - **The message is a recap.** Instead of a generic "Claude is waiting for your input", the
   provided hook reads the session transcript (`transcript_path`) and uses Claude Code's own
   session recap (the latest `away_summary` entry) as the notification text, so you see a
@@ -145,10 +198,12 @@ notifications to an HTTPS endpoint), and **Remote Approvals (Bash)**. There is a
 
 ### Inbox controls
 
-A search field plus a status filter narrow the list. Keyboard navigation works when the list has
-focus: **↑/↓** select, **Return** opens the selected notification (focuses its terminal), and
-**Delete** dismisses it. A small dot in the header shows the iTerm2 focus-connection health (only
-when iTerm2 is in use).
+A search field, a status filter, and a **sort selector** narrow and order the list. Sort options:
+**Recent** (default, newest first), **Project** (grouped by project name, then by tab order, then
+recency), and **Tab** (the iTerm tab order ⌘N; rows without a resolved shortcut go last). The
+choice is remembered. Keyboard navigation works when the list has focus: **↑/↓** select, **Return**
+opens the selected notification (focuses its terminal), and **Delete** dismisses it. A small dot in
+the header shows the iTerm2 focus-connection health (only when iTerm2 is in use).
 
 ### One-command setup
 

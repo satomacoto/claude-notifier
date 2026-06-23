@@ -9,6 +9,18 @@ let availableSounds = ["", "Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "
 let projectSounds = ["Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero",
                      "Morse", "Pop", "Purr", "Sosumi", "Submarine", "Tink"]
 
+// Left-of-row indicator: an SF Symbol per sound, so the icon corresponds to the notification's
+// sound (and thus differs per project/tab when Per-Project Sound is on). Unknown/empty -> a
+// plain filled circle, matching the old status dot. Tinted by the status color at the call site.
+let soundSymbols: [String: String] = [
+    "Basso": "hexagon.fill", "Blow": "cloud.fill", "Bottle": "drop.fill",
+    "Frog": "leaf.fill", "Funk": "bolt.fill", "Glass": "diamond.fill",
+    "Hero": "star.fill", "Morse": "ellipsis", "Ping": "dot.radiowaves.left.and.right",
+    "Pop": "circle.fill", "Purr": "pawprint.fill", "Sosumi": "bell.fill",
+    "Submarine": "triangle.fill", "Tink": "sparkles",
+]
+func symbolForSound(_ sound: String) -> String { soundSymbols[sound] ?? "circle.fill" }
+
 let defaultsKeySound = "defaultSound"
 let defaultsKeyPerProjectSound = "perProjectSound"
 let defaultsKeyPerStatusSound = "perStatusSound"
@@ -446,6 +458,33 @@ func shortcutString(from result: TabLookupResult) -> String? {
     return sc
 }
 
+/// One ListSessions round-trip → current (shortcut, tabId) for every tmux window id. Used to
+/// refresh stored shortcuts that went stale after iTerm tabs were reordered or closed (the tmux
+/// window id is stable, but its tab position — and thus ⌘N — is not).
+func iterm2ResolveAllTmuxShortcuts() -> [String: (shortcut: String?, tabId: String?)] {
+    let path = iterm2SocketPath()
+    guard FileManager.default.fileExists(atPath: path), let fd = connectUDS(path) else { return [:] }
+    defer { Darwin.close(fd) }
+    guard websocketHandshake(fd),
+          websocketSendBinary(fd, buildListSessionsMessage()),
+          let payload = readWebSocketPayload(fd),
+          let listResp = extractMessages(payload, fieldNumber: 106).first else { return [:] }
+    let windows = extractMessages(listResp, fieldNumber: 1)
+    var out: [String: (shortcut: String?, tabId: String?)] = [:]
+    for window in windows {
+        let windowNumber = Int(extractVarint(window, fieldNumber: 4) ?? 0)
+        let tabs = extractMessages(window, fieldNumber: 1)
+        for (tabIndex, tab) in tabs.enumerated() {
+            guard let tabID = extractStrings(tab, fieldNumber: 2).first else { continue }
+            let result = TabLookupResult(tabID: tabID, tabIndex: tabIndex,
+                                         windowNumber: windowNumber, totalWindows: windows.count)
+            let sc = shortcutString(from: result)
+            for tmuxId in extractStrings(tab, fieldNumber: 4) { out[tmuxId] = (sc, tabID) }
+        }
+    }
+    return out
+}
+
 /// Focus an iTerm2 tmux window by looking up the tab via ListSessions, then activating it.
 /// Returns the keyboard shortcut string (e.g. "⌘3") on success.
 func iterm2FocusTmuxWindow(_ tmuxWindowID: String) -> String? {
@@ -500,12 +539,14 @@ func iterm2LookupTab(tmuxWindowID: String) -> (shortcut: String?, tabId: String?
 /// Bring an app to the foreground by bundle identifier.
 func activateApp(bundleID: String) {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-        // Use AppleScript as NSRunningApplication.activate is unreliable on macOS 14+
-        let script = NSAppleScript(source: """
-            tell application id "\(bundleID)" to activate
-        """)
-        var error: NSDictionary?
-        script?.executeAndReturnError(&error)
+        // Activate via LaunchServices. This needs NO Apple Events / Automation (TCC) permission,
+        // unlike AppleScript `activate`, so it keeps working even when the app is ad-hoc re-signed
+        // (which invalidates the per-cdhash Automation grant). NSRunningApplication.activate is
+        // unreliable on macOS 14+, but openApplication (LaunchServices) reliably brings it front.
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: cfg, completionHandler: nil)
     }
 }
 
@@ -543,8 +584,23 @@ let notificationHookCommand = #"IN=$(cat) && MSG=$(echo "$IN" | jq -r '.message 
 /// the inbox, and returns the matching permissionDecision; on timeout it defers to the normal prompt.
 let approvalHookCommand = ##"[ -f /tmp/claude-notifier-remote-approvals ] || exit 0; IN=$(cat); TOOL=$(echo "$IN" | jq -r '.tool_name // "Bash"'); CMD=$(echo "$IN" | jq -r '.tool_input.command // .tool_input.file_path // ""' | tr '\n' ' ' | cut -c1-200); REQ="$PPID-$$-$(date +%s)"; SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null || echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null || echo ''); TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null || echo ''); TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null || echo "$TERM_PROGRAM"); TAPP=$(case "$TPROG" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac); PROJECT=$(basename "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"); ENC(){ python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$1"; }; rm -f "/tmp/claude-notifier-decision-$REQ.json"; open -g "claude-notifier://notify?title=$(ENC "$PROJECT")&message=$(ENC "$TOOL: $CMD")&terminal=$TAPP&session=$SID&tmux_window_id=$(ENC "$TWID")&tty=$(ENC "$TTY")&status=review&tool=$(ENC "$TOOL")&decision=$REQ"; D=""; for i in $(seq 1 120); do if [ -f "/tmp/claude-notifier-decision-$REQ.json" ]; then D=$(jq -r '.decision // ""' "/tmp/claude-notifier-decision-$REQ.json" 2>/dev/null); rm -f "/tmp/claude-notifier-decision-$REQ.json"; break; fi; sleep 0.5; done; [ "$D" = "allow" ] && printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"Approved in claude-notifier"}}'; [ "$D" = "deny" ] && printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Denied in claude-notifier"}}'; exit 0"##
 
+/// UserPromptSubmit hook: light up the "thinking" (Claude is working) state for this session the
+/// moment a prompt is submitted. Silent, reuses the context captured at SessionStart. Kept short
+/// because UserPromptSubmit has a tighter 30s timeout.
+let thinkingStartHookCommand = #"SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null||echo ''); TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null||echo "$TERM_PROGRAM"); TAPP=$(case "$TPROG" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac); PROJECT=$(basename "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null||echo "$PWD")"); ENC(){ python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }; open -g "claude-notifier://notify?title=$(ENC "$PROJECT")&terminal=$TAPP&session=$SID&tmux_window_id=$(ENC "$TWID")&tty=$(ENC "$TTY")&status=running&thinking=start""#
+
+/// Stop / StopFailure hook: clear this session's "thinking" state when the turn ends. Only clears
+/// a still-thinking row; a real notification that arrived mid-turn is left intact.
+let thinkingStopHookCommand = #"SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); ENC(){ python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }; open -g "claude-notifier://notify?session=$SID&tmux_window_id=$(ENC "$TWID")&thinking=stop""#
+
 func focusTerminal(terminalType: String, itermSession: String?, tmuxWindowID: String?,
                    bundle: String? = nil, tty: String? = nil) {
+    var terminalType = terminalType
+    // tmux sessions report terminal=unknown but still carry an iTerm session id (w<N>t<N>p<N>:UUID).
+    // Normalize so existing rows stored as "unknown" still focus the iTerm2 tab/tmux window on click.
+    if terminalType == "unknown", let s = itermSession, extractSessionUUID(s) != s {
+        terminalType = "iterm2"
+    }
     if terminalType == "iterm2" {
         // 1) tmux integration → ListSessions to find matching tab, then Activate
         if let twID = tmuxWindowID, !twID.isEmpty, iterm2FocusTmuxWindow(twID) != nil {
@@ -786,6 +842,7 @@ let defaultsKeyBannerEnabled = "bannerEnabled" // legacy bool, migrated to banne
 let defaultsKeyBannerMode = "bannerMode"        // "off" | "transient" | "persist"
 let defaultsKeyAlwaysOnTop = "alwaysOnTop"
 let defaultsKeyCompactRows = "compactRows"      // truncate each row's message to one line
+let defaultsKeySortMode = "sortMode"            // inbox order: "recent" | "project" | "tab"
 let defaultsKeyQuietEnabled = "quietHoursEnabled"
 let defaultsKeyQuietStart = "quietHoursStart"   // minutes from midnight
 let defaultsKeyQuietEnd = "quietHoursEnd"       // minutes from midnight
@@ -899,12 +956,12 @@ func relativeTimeString(_ date: Date) -> String {
 struct NotificationItem: Codable {
     let id: String            // dedup key: tmux window id ?? session ?? uuid
     let sessionUUID: String?  // normalized bare iTerm session UUID (non-tmux focus match)
-    let tabId: String?        // resolved iTerm tab id (tmux focus match)
+    var tabId: String?        // resolved iTerm tab id (tmux focus match); refreshed live
     let terminal: String      // raw terminal type, passed to focusTerminal()
     let terminalName: String? // display name: "iTerm" / "VS Code" / "Terminal"
     let rawSession: String?   // raw ITERM_SESSION_ID, passed to focusTerminal()
     let tmux: String?         // tmux window id, passed to focusTerminal()
-    let shortcut: String?     // iTerm tab shortcut like "⌘3"
+    var shortcut: String?     // iTerm tab shortcut like "⌘3"; refreshed live (tabs get renumbered)
     var title: String         // project name
     var message: String
     var status: NotifStatus
@@ -917,24 +974,28 @@ struct NotificationItem: Codable {
     var tool: String? = nil   // tool that triggered the prompt (e.g. "Bash"), if the hook sent it
     var tty: String? = nil    // controlling tty (e.g. /dev/ttys004), for Terminal.app tab focus
     var decision: String? = nil // pending approval request id; row shows Approve/Deny while unread
+    var sound: String = ""    // resolved sound name; drives the row's left SF Symbol icon
+    var thinking: Bool = false // live "Claude is working" state: silent, shows a spinner, not counted as unread
 
     init(id: String, sessionUUID: String?, tabId: String?, terminal: String,
          terminalName: String?, rawSession: String?, tmux: String?, shortcut: String?,
          title: String, message: String, status: NotifStatus, date: Date, read: Bool,
          count: Int = 1, source: String? = nil, bundle: String? = nil, escalated: Bool = false,
-         tool: String? = nil, tty: String? = nil, decision: String? = nil) {
+         tool: String? = nil, tty: String? = nil, decision: String? = nil, sound: String = "",
+         thinking: Bool = false) {
         self.id = id; self.sessionUUID = sessionUUID; self.tabId = tabId
         self.terminal = terminal; self.terminalName = terminalName
         self.rawSession = rawSession; self.tmux = tmux; self.shortcut = shortcut
         self.title = title; self.message = message; self.status = status
         self.date = date; self.read = read; self.count = count
         self.source = source; self.bundle = bundle; self.escalated = escalated
-        self.tool = tool; self.tty = tty; self.decision = decision
+        self.tool = tool; self.tty = tty; self.decision = decision; self.sound = sound
+        self.thinking = thinking
     }
 
     enum CodingKeys: String, CodingKey {
         case id, sessionUUID, tabId, terminal, terminalName, rawSession, tmux, shortcut
-        case title, message, status, date, read, count, source, bundle, escalated, tool, tty, decision
+        case title, message, status, date, read, count, source, bundle, escalated, tool, tty, decision, sound, thinking
     }
 
     init(from decoder: Decoder) throws {
@@ -959,6 +1020,8 @@ struct NotificationItem: Codable {
         tool = try c.decodeIfPresent(String.self, forKey: .tool)
         tty = try c.decodeIfPresent(String.self, forKey: .tty)
         decision = try c.decodeIfPresent(String.self, forKey: .decision)
+        sound = (try c.decodeIfPresent(String.self, forKey: .sound)) ?? ""
+        thinking = (try c.decodeIfPresent(Bool.self, forKey: .thinking)) ?? false
     }
 }
 
@@ -971,7 +1034,8 @@ final class NotificationStore {
     private let maxItems = 50
     private var saveWork: DispatchWorkItem?
 
-    var unreadCount: Int { items.reduce(0) { $0 + ($1.read ? 0 : 1) } }
+    // "thinking" rows are a live state indicator, not an actionable alert, so they never count.
+    var unreadCount: Int { items.reduce(0) { $0 + (($1.read || $1.thinking) ? 0 : 1) } }
 
     /// Notify observers and schedule a debounced disk save after any mutation.
     private func changed() {
@@ -1044,10 +1108,46 @@ final class NotificationStore {
         if items.count != before { changed() }
     }
 
+    /// End a tab's live "thinking" state when its turn ends: stop the spinner but keep the row as
+    /// quiet, clickable history (dimmed/read, not counted as unread) so you can still jump to the
+    /// tab. A real notification that arrived mid-turn (no longer thinking) is left untouched.
+    func finishThinking(id: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }), items[i].thinking else { return }
+        items[i].thinking = false
+        items[i].read = true
+        changed()
+    }
+
+    /// Refresh stored tab shortcuts/ids from a freshly resolved {tmuxWindowID: (shortcut, tabId)}
+    /// map, so the displayed ⌘N and the Tab sort stay current after iTerm tabs are reordered.
+    /// No-op (no save/redraw) when nothing actually changed.
+    func updateRouting(_ map: [String: (shortcut: String?, tabId: String?)]) {
+        var didChange = false
+        for i in items.indices {
+            guard let tw = items[i].tmux else { continue }
+            // iTerm2's ListSessions returns tmux window ids without the "@" prefix; strip it to match.
+            let key = tw.hasPrefix("@") ? String(tw.dropFirst()) : tw
+            guard let info = map[key] else { continue }
+            if items[i].shortcut != info.shortcut { items[i].shortcut = info.shortcut; didChange = true }
+            if let tid = info.tabId, items[i].tabId != tid { items[i].tabId = tid; didChange = true }
+        }
+        if didChange { changed() }
+    }
+
     func clearAll() {
         guard !items.isEmpty else { return }
         items.removeAll()
         changed()
+    }
+
+    /// Whether any acted-on/read rows exist (read history, including finished "thinking" rows).
+    var hasRead: Bool { items.contains { $0.read } }
+
+    /// Clear only the read (acted-on) rows, keeping pending (unread) and in-progress (thinking) ones.
+    func clearRead() {
+        let before = items.count
+        items.removeAll { $0.read }
+        if items.count != before { changed() }
     }
 
     // MARK: Persistence
@@ -1116,6 +1216,7 @@ final class NotificationRowView: NSView {
     private let dismissButton = NSButton()
     private var approveButton: NSButton?
     private var denyButton: NSButton?
+    private var messageLabel: NSTextField?
     private var hovered = false
     private var pressed = false
     private var trackingArea: NSTrackingArea?
@@ -1133,23 +1234,56 @@ final class NotificationRowView: NSView {
     private func build(item: NotificationItem, width: CGFloat) {
         let dimmed = item.read
 
-        let dot = NSView()
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        dot.wantsLayer = true
-        dot.layer?.backgroundColor = (dimmed ? item.status.color.withAlphaComponent(0.35)
-                                             : item.status.color).cgColor
-        dot.layer?.cornerRadius = 4
-        NSLayoutConstraint.activate([
-            dot.widthAnchor.constraint(equalToConstant: 8),
-            dot.heightAnchor.constraint(equalToConstant: 8),
-        ])
+        // Left indicator: while Claude is working, a spinner; otherwise an SF Symbol for this
+        // notification's sound, tinted by the status color (dimmed when read). Falls back to a
+        // colored dot on macOS < 11.
+        let tint = dimmed ? item.status.color.withAlphaComponent(0.4) : item.status.color
+        let iconSize: CGFloat = 15
+        let indicator: NSView
+        if item.thinking {
+            let spinner = NSProgressIndicator()
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.isIndeterminate = true
+            spinner.startAnimation(nil)
+            NSLayoutConstraint.activate([
+                spinner.widthAnchor.constraint(equalToConstant: iconSize),
+                spinner.heightAnchor.constraint(equalToConstant: iconSize),
+            ])
+            indicator = spinner
+        } else if #available(macOS 11.0, *),
+           let img = NSImage(systemSymbolName: symbolForSound(item.sound),
+                             accessibilityDescription: item.sound.isEmpty ? "no sound" : item.sound) {
+            let iv = NSImageView()
+            iv.translatesAutoresizingMaskIntoConstraints = false
+            iv.image = img.withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
+            iv.contentTintColor = tint
+            iv.toolTip = item.sound.isEmpty ? "No sound" : "Sound: \(item.sound)"
+            NSLayoutConstraint.activate([
+                iv.widthAnchor.constraint(equalToConstant: iconSize),
+                iv.heightAnchor.constraint(equalToConstant: iconSize),
+            ])
+            indicator = iv
+        } else {
+            let dot = NSView()
+            dot.translatesAutoresizingMaskIntoConstraints = false
+            dot.wantsLayer = true
+            dot.layer?.backgroundColor = tint.cgColor
+            dot.layer?.cornerRadius = 4
+            NSLayoutConstraint.activate([
+                dot.widthAnchor.constraint(equalToConstant: 8),
+                dot.heightAnchor.constraint(equalToConstant: 8),
+            ])
+            indicator = dot
+        }
         let dotHolder = NSView()
         dotHolder.translatesAutoresizingMaskIntoConstraints = false
-        dotHolder.addSubview(dot)
+        dotHolder.addSubview(indicator)
         NSLayoutConstraint.activate([
-            dotHolder.widthAnchor.constraint(equalToConstant: 8),
-            dot.topAnchor.constraint(equalTo: dotHolder.topAnchor, constant: 3),
-            dot.centerXAnchor.constraint(equalTo: dotHolder.centerXAnchor),
+            dotHolder.widthAnchor.constraint(equalToConstant: iconSize),
+            indicator.topAnchor.constraint(equalTo: dotHolder.topAnchor, constant: 1),
+            indicator.centerXAnchor.constraint(equalTo: dotHolder.centerXAnchor),
         ])
         dotHolder.setContentHuggingPriority(.required, for: .horizontal)
 
@@ -1194,6 +1328,7 @@ final class NotificationRowView: NSView {
         message.preferredMaxLayoutWidth = max(120, width - 64)
         message.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         message.isHidden = item.message.isEmpty
+        messageLabel = message
 
         var colViews: [NSView] = [titleRow]
         if !item.message.isEmpty { colViews.append(message) }
@@ -1219,6 +1354,12 @@ final class NotificationRowView: NSView {
         textCol.alignment = .leading
         textCol.spacing = 2
         textCol.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        // Make the wrapping message span the full text-column width so it reflows when the
+        // window is resized. The .leading stack alignment would otherwise size it to the
+        // text's natural width, leaving the label pinned narrow on a wide window.
+        if !item.message.isEmpty {
+            message.widthAnchor.constraint(equalTo: textCol.widthAnchor).isActive = true
+        }
 
         dismissButton.translatesAutoresizingMaskIntoConstraints = false
         dismissButton.isBordered = false
@@ -1250,6 +1391,17 @@ final class NotificationRowView: NSView {
             row.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
         ])
+    }
+
+    // Keep the wrapping message label's preferred width in sync with its actual width so it
+    // re-wraps (and the row re-heights) when the window is resized horizontally.
+    override func layout() {
+        super.layout()
+        guard let m = messageLabel, m.frame.width > 1 else { return }
+        if abs(m.preferredMaxLayoutWidth - m.frame.width) > 0.5 {
+            m.preferredMaxLayoutWidth = m.frame.width
+            m.invalidateIntrinsicContentSize()
+        }
     }
 
     @objc private func dismissClicked() { onDismiss?(id) }
@@ -1355,7 +1507,7 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
     private let store: NotificationStore
     var onSelect: ((String) -> Void)?
     var onDismiss: ((String) -> Void)?
-    var onClearAll: (() -> Void)?
+    var onClearRead: (() -> Void)?
     var onSettings: ((NSView) -> Void)?
     var onDecision: ((String, String) -> Void)?
 
@@ -1370,6 +1522,10 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
     private let clearButton = NSButton()
     private let searchField = NSSearchField()
     private let filterPopup = NSPopUpButton()
+    private let sortPopup = NSPopUpButton()
+    private let sortModes: [(key: String, label: String)] = [
+        ("recent", "Recent"), ("project", "Project"), ("tab", "Tab"),
+    ]
     private let scrollView = NSScrollView()
     private let listStack = NSStackView()
     private let docView = FlippedView()
@@ -1411,13 +1567,14 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
         spacer.translatesAutoresizingMaskIntoConstraints = false
         spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
 
-        clearButton.title = "Clear all"
+        clearButton.title = "Clear read"
         clearButton.isBordered = false
         clearButton.bezelStyle = .inline
         clearButton.font = .systemFont(ofSize: 11)
         clearButton.contentTintColor = .controlAccentColor
         clearButton.target = self
-        clearButton.action = #selector(clearClicked)
+        clearButton.action = #selector(clearReadClicked)
+        clearButton.toolTip = "Clear read notifications (keep pending and in-progress). Clear All is in the Notifications menu."
         clearButton.setContentHuggingPriority(.required, for: .horizontal)
 
         let gear = NSButton()
@@ -1460,9 +1617,18 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
         filterPopup.target = self
         filterPopup.action = #selector(filterChanged(_:))
         filterPopup.setContentHuggingPriority(.required, for: .horizontal)
+        filterPopup.toolTip = "Filter by status"
         rebuildFilterPopup()
 
-        let filterBar = NSStackView(views: [searchField, filterPopup])
+        sortPopup.controlSize = .small
+        sortPopup.font = .systemFont(ofSize: 11)
+        sortPopup.target = self
+        sortPopup.action = #selector(sortChanged(_:))
+        sortPopup.setContentHuggingPriority(.required, for: .horizontal)
+        sortPopup.toolTip = "Sort order"
+        rebuildSortPopup()
+
+        let filterBar = NSStackView(views: [searchField, filterPopup, sortPopup])
         filterBar.orientation = .horizontal
         filterBar.spacing = 8
         filterBar.alignment = .centerY
@@ -1550,7 +1716,26 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
         }
     }
 
-    @objc private func clearClicked() { onClearAll?() }
+    private func rebuildSortPopup() {
+        sortPopup.removeAllItems()
+        for mode in sortModes {
+            sortPopup.addItem(withTitle: mode.label)
+            sortPopup.lastItem?.representedObject = mode.key
+        }
+        let cur = UserDefaults.standard.string(forKey: defaultsKeySortMode) ?? "recent"
+        if let idx = sortModes.firstIndex(where: { $0.key == cur }) { sortPopup.selectItem(at: idx) }
+    }
+
+    private var sortMode: String { UserDefaults.standard.string(forKey: defaultsKeySortMode) ?? "recent" }
+
+    @objc private func sortChanged(_ sender: NSPopUpButton) {
+        if let key = sender.selectedItem?.representedObject as? String {
+            UserDefaults.standard.set(key, forKey: defaultsKeySortMode)
+        }
+        refresh()
+    }
+
+    @objc private func clearReadClicked() { onClearRead?() }
     @objc private func settingsClicked(_ sender: NSButton) { onSettings?(sender) }
 
     @objc private func filterChanged(_ sender: NSPopUpButton) {
@@ -1601,7 +1786,7 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
         }
         countLabel.stringValue = label
 
-        clearButton.isHidden = total == 0
+        clearButton.isHidden = !store.hasRead   // "Clear read" only matters when there's read history
         emptyLabel.stringValue = total == 0 ? "No notifications" : "No matches"
         emptyLabel.isHidden = !displayed.isEmpty
         scrollView.isHidden = displayed.isEmpty
@@ -1637,13 +1822,45 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
 
     private func filteredItems() -> [NotificationItem] {
         let q = searchText.lowercased()
-        return store.items.filter { item in
+        let filtered = store.items.filter { item in
             if let f = statusFilter, item.status != f { return false }
             if !q.isEmpty,
                !item.title.lowercased().contains(q),
                !item.message.lowercased().contains(q) { return false }
             return true
         }
+        // "recent" keeps the store order (newest first). Project/Tab apply a stable order, with
+        // recency as the tiebreaker so same-project / same-tab rows still read newest-first.
+        switch sortMode {
+        case "project":
+            // Group by project name; within the same project order by tab (⌘N), then newest first.
+            return filtered.sorted { a, b in
+                let ta = a.title.lowercased(), tb = b.title.lowercased()
+                if ta != tb { return ta < tb }
+                let ka = tabOrderKey(a), kb = tabOrderKey(b)
+                if ka != kb { return ka < kb }
+                return a.date > b.date
+            }
+        case "tab":
+            return filtered.sorted { a, b in
+                let ka = tabOrderKey(a), kb = tabOrderKey(b)
+                return ka == kb ? a.date > b.date : ka < kb
+            }
+        default:
+            return filtered
+        }
+    }
+
+    /// Sort key for "Tab" order: (window number, tab number) parsed from the iTerm shortcut
+    /// ("⌘3", "win2 ⌘3"). Rows without a resolved shortcut sort to the end.
+    private func tabOrderKey(_ item: NotificationItem) -> (Int, Int) {
+        guard let sc = item.shortcut else { return (Int.max, Int.max) }
+        var win = 1, tab = Int.max
+        for part in sc.split(separator: " ") {
+            if part.hasPrefix("win"), let n = Int(part.dropFirst(3)) { win = n }
+            else if part.hasPrefix("⌘"), let n = Int(part.dropFirst(1)) { tab = n }
+        }
+        return (win, tab)
     }
 
     /// Make the list the first responder so arrow keys navigate (called when the window opens).
@@ -1716,6 +1933,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var statusMenu: NSMenu!
     private var hasAutoShownWindow = false
+    // True when the app was launched (or activated) only to deliver a notification URL, i.e.
+    // a background `open -g` launch rather than the user opening the app. In that case we must
+    // not pop the window or steal focus from the terminal.
+    private var launchedByURL = false
+    // True when the app became active before the window was built (the crash-recovery modal can
+    // drain events during launch). We re-evaluate the auto-show once setup completes.
+    private var becameActiveBeforeSetup = false
 
     // Last-known active iTerm2 session/tab (from FocusMonitor), used to silence a banner/sound
     // when a notification fires for the tab the user is already looking at.
@@ -1732,7 +1956,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         inboxVC = InboxViewController(store: store)
         inboxVC.onSelect = { [weak self] id in self?.focusAndRead(id) }
         inboxVC.onDismiss = { [weak self] id in self?.store.remove(id: id) }
-        inboxVC.onClearAll = { [weak self] in self?.store.clearAll() }
+        inboxVC.onClearRead = { [weak self] in self?.store.clearRead() }
         inboxVC.onSettings = { [weak self] view in self?.showSettingsMenu(from: view) }
         inboxVC.onDecision = { [weak self] id, d in self?.writeDecision(id, d) }
 
@@ -1770,6 +1994,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         focusMonitor.start()
         startEscalationTimer()
+
+        // While the inbox is open, keep tab shortcuts (⌘N) current so they don't drift as iTerm
+        // tabs are reordered/closed. Only does socket work when the window is actually visible.
+        let scTimer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
+            guard let self = self, self.window?.isVisible == true else { return }
+            self.refreshTabShortcuts()
+        }
+        RunLoop.main.add(scTimer, forMode: .common)
+
+        // If the app became active during launch before the window existed (a crash-recovery
+        // modal draining events), evaluate the auto-show now that setup is complete.
+        if becameActiveBeforeSetup { autoShowUnlessLaunchedByURL() }
     }
 
     // MARK: Menu bar status item
@@ -1816,11 +2052,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         window.title = "Claude Notifier"
         window.isReleasedWhenClosed = false   // closing hides the window; the app keeps running
+        // We manage the single window ourselves; disabling state restoration avoids the
+        // crash-recovery "reopen windows?" modal that can run (and drain events) during launch.
+        window.isRestorable = false
         window.contentViewController = inboxVC
         window.setContentSize(size)
-        // Lock the width (rows wrap to a fixed width); allow vertical resize.
-        window.contentMinSize = NSSize(width: 380, height: 220)
-        window.contentMaxSize = NSSize(width: 380, height: 100_000)
+        // Rows reflow to the window width; allow both horizontal and vertical resize.
+        window.contentMinSize = NSSize(width: 320, height: 220)
+        window.contentMaxSize = NSSize(width: 900, height: 100_000)
         window.setFrameAutosaveName("ClaudeNotifierMain")
         if window.frame.origin == .zero { window.center() }
         applyWindowLevel()
@@ -1832,17 +2071,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func showWindow() {
+        // Guard against being called before applicationDidFinishLaunching builds these (e.g.
+        // the main queue draining during launch); accessing the implicitly-unwrapped optionals
+        // while nil would crash.
+        guard let window = window, let inboxVC = inboxVC else { return }
         hasAutoShownWindow = true
         inboxVC.refresh()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         inboxVC.focusList()
+        refreshTabShortcuts()   // ⌘N may have changed since the notifications arrived
+    }
+
+    /// Re-resolve each tmux row's current tab shortcut/id off the main thread, then apply on the
+    /// main thread. iTerm renumbers tabs on reorder/close, so the stored ⌘N goes stale.
+    func refreshTabShortcuts() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let map = iterm2ResolveAllTmuxShortcuts()
+            guard !map.isEmpty else { return }
+            DispatchQueue.main.async { self?.store.updateRouting(map) }
+        }
     }
 
     // Show the window the first time the app becomes active (i.e. a manual launch or the
     // first Dock click). Later activations don't re-show it, so closing the window sticks.
+    // A background launch triggered by a notification URL (`open -g`) must NOT auto-show:
+    // macOS can still activate a freshly launched regular app despite `-g`, which would pop
+    // the window and steal focus from the terminal. We detect that via `launchedByURL`.
     func applicationDidBecomeActive(_ notification: Notification) {
-        if !hasAutoShownWindow { showWindow() }
+        guard !hasAutoShownWindow else { return }
+        // The window may not exist yet: macOS can drain the main queue during launch (e.g. the
+        // crash-recovery "reopen windows?" modal) and fire this before applicationDidFinishLaunching
+        // builds the window. Defer the decision to the end of launch in that case.
+        guard window != nil else { becameActiveBeforeSetup = true; return }
+        autoShowUnlessLaunchedByURL()
+    }
+
+    /// Auto-show the inbox on a genuine manual launch, but stay in the background when the app
+    /// was launched only to deliver a notification URL. Notification opens are delivered before
+    /// the window is built, so `launchedByURL` is already known by the time this runs.
+    private func autoShowUnlessLaunchedByURL() {
+        guard !hasAutoShownWindow, window != nil else { return }
+        if launchedByURL {
+            hasAutoShownWindow = true
+            // Yield focus back to the terminal if macOS activated us despite `-g`.
+            if window?.isVisible != true { NSApp.hide(nil) }
+        } else {
+            showWindow()
+        }
     }
 
     // Keep running after the window is closed — this is a background notifier.
@@ -2284,6 +2560,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         upsert(event: "Notification", command: notificationHookCommand, matcher: "")
         // Approval hook is a no-op until Remote Approvals is enabled, so it's safe to install.
         upsert(event: "PreToolUse", command: approvalHookCommand, matcher: "Bash")
+        // Live "thinking" indicator: UserPromptSubmit lights it, Stop/StopFailure clear it.
+        upsert(event: "UserPromptSubmit", command: thinkingStartHookCommand, matcher: nil)
+        upsert(event: "Stop", command: thinkingStopHookCommand, matcher: nil)
+        upsert(event: "StopFailure", command: thinkingStopHookCommand, matcher: nil)
         root["hooks"] = hooks
 
         guard let out = try? JSONSerialization.data(withJSONObject: root,
@@ -2296,8 +2576,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let confirm = NSAlert()
         confirm.messageText = "Install claude-notifier hooks?"
         confirm.informativeText = """
-        This updates ~/.claude/settings.json (SessionStart + Notification). A timestamped backup \
-        is saved first, and existing claude-notifier entries are replaced (not duplicated).
+        This updates ~/.claude/settings.json (SessionStart, Notification, PreToolUse, \
+        UserPromptSubmit, Stop, StopFailure). A timestamped backup is saved first, and existing \
+        claude-notifier entries are replaced (not duplicated); your other hooks are left untouched.
 
         Result preview:
         \(String(preview.prefix(1400)))
@@ -2341,7 +2622,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             id: UUID().uuidString, sessionUUID: nil, tabId: nil,
             terminal: "unknown", terminalName: nil, rawSession: nil, tmux: nil, shortcut: nil,
             title: "claude-notifier", message: "Test notification (\(status.label))",
-            status: status, date: Date(), read: false
+            status: status, date: Date(), read: false,
+            sound: resolvedSound(project: "claude-notifier", status: status, explicit: nil)
         ))
     }
 
@@ -2362,6 +2644,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func application(_ application: NSApplication, open urls: [URL]) {
         // Remember the frontmost app so we can restore focus after delivering a banner.
         let previousApp = NSWorkspace.shared.frontmostApplication
+
+        // A notify URL arriving before the window has ever been shown means this is a
+        // background (`open -g`) launch to deliver a notification, not the user opening the
+        // app. Mark it so applicationDidBecomeActive keeps us in the background.
+        if !hasAutoShownWindow { launchedByURL = true }
 
         for url in urls {
             guard url.scheme == "claude-notifier" else { continue }
@@ -2388,9 +2675,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // One notification per tab: key on tmux window id, else session, else unique.
         let id = twID ?? sess ?? UUID().uuidString
 
+        // Live "thinking" state (UserPromptSubmit -> start, Stop/StopFailure -> stop). The stop
+        // signal only clears a still-thinking row, never a real notification that arrived mid-turn.
+        let thinkingParam = params["thinking"].flatMap { $0.isEmpty ? nil : $0 }
+        if thinkingParam == "stop" {
+            store.finishThinking(id: id)
+            return
+        }
+        let isThinking = (thinkingParam == "start")
+
         let projectName = params["title"] ?? "Claude Code"
         let messageText = params["message"] ?? ""
-        let terminal = params["terminal"] ?? "unknown"
+        var terminal = params["terminal"] ?? "unknown"
+        // A session launched inside tmux reports TERM_PROGRAM=tmux, so the hook sends
+        // terminal=unknown — which would skip iTerm2 tab focus and tab-shortcut resolution.
+        // iTerm2 still provides an ITERM_SESSION_ID (w<N>t<N>p<N>:UUID), so if the session carries
+        // a real UUID, treat it as iTerm2 (tmux tab focus keys on tmux_window_id either way).
+        if terminal == "unknown", let s = sess, extractSessionUUID(s) != s {
+            terminal = "iterm2"
+        }
         let status = NotifStatus(param: params["status"])
 
         let terminalName = terminalDisplayNames[terminal]
@@ -2419,8 +2722,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Banner/sound are suppressed when focused or while muted (quiet hours / manual pause);
-        // the inbox still collects the item either way.
-        if !focused && !isQuietNow() {
+        // the inbox still collects the item either way. A "thinking" update is always silent.
+        if !isThinking && !focused && !isQuietNow() {
             presentBanner(id: id,
                           title: bannerTitle(project: projectName, terminalName: terminalName, shortcut: shortcut),
                           message: messageText, sound: soundName,
@@ -2448,8 +2751,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             bundle: bundle,
             tool: params["tool"].flatMap { $0.isEmpty ? nil : $0 },
             tty: tty,
-            decision: params["decision"].flatMap { $0.isEmpty ? nil : $0 }
-        ), forceRead: focused)
+            decision: params["decision"].flatMap { $0.isEmpty ? nil : $0 },
+            sound: soundName,
+            thinking: isThinking
+        ), forceRead: isThinking ? false : focused)
         // Visual arrival cue is the Dock badge (updated via store.onChange → updateBadge);
         // no Dock bounce, which the user found too noisy.
     }

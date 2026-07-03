@@ -66,9 +66,14 @@ open "claude-notifier://quit"
 | `title` | No | `Claude Code` | Notification title |
 | `message` | No | (empty) | Notification body |
 | `sound` | No | User preference | Sound name (e.g. `Ping`, `Glass`, `Submarine`) |
-| `terminal` | No | `unknown` | Terminal type: `iterm2`, `vscode`, `terminal`, `ghostty`, `wezterm`, `kitty`, `alacritty`, `warp` |
-| `session` | No | None | iTerm2 session ID (`ITERM_SESSION_ID`) for non-tmux tab focus |
+| `terminal` | No | `unknown` | Terminal type: `iterm2`, `vscode`, `terminal`, `ghostty`, `wezterm`, `kitty`, `alacritty`, `warp`, `zed` |
+| `terminal_name` | No | Built-in table | Display name override (e.g. `Zed`); lets the hook label apps not in the built-in table |
+| `bundle` | No | Built-in table | App bundle id override (e.g. `dev.zed.Zed`); lets clicks focus apps not in the built-in table |
+| `session` | No | None | iTerm2 session ID (`ITERM_SESSION_ID`) for non-tmux tab focus; the ctx-script hook sends a stable `pid-<pid>` key for non-iTerm sessions |
 | `tmux_window_id` | No | None | tmux window ID (e.g. `@4`) for tmux integration tab focus |
+| `tmux_socket` | No | None | tmux server socket path; with `tmux_session`, lets a click re-resolve which terminal is attached right now |
+| `tmux_session` | No | None | tmux session ID (e.g. `$0`); see `tmux_socket` |
+| `workdir` | No | None | Project root path; a click on a Zed notification focuses that workspace's window via the `zed` CLI |
 | `status` | No | `review` | Status dot color: `running`, `waiting`, `review`, `done`, `failed`, `message` |
 | `source` | No | None | Optional tag shown in the row's meta line (e.g. `recap`, `title`, `alert`) to mark which message source was used |
 | `tty` | No | None | Controlling tty (e.g. `/dev/ttys004`) for Terminal.app tab-level focus |
@@ -79,7 +84,23 @@ All values must be URL-encoded. Use `open -g` to avoid stealing focus from the c
 
 ## Claude Code Hooks Integration
 
-Add to `~/.claude/settings.json`:
+First install the shared context-resolver script (the in-app **Install Claude Code Hooks…**
+menu item does this for you):
+
+```bash
+mkdir -p ~/.claude/hooks
+cp hooks/claude-notifier-ctx.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/claude-notifier-ctx.sh
+```
+
+The script resolves which terminal a Claude Code process belongs to **at event time**, from
+the process tree and live tmux state instead of environment variables (which go stale: an
+editor launched from a tmux shell hands stale `$TMUX` / `$ITERM_SESSION_ID` copies to every
+terminal it spawns). Inside tmux it asks the tmux server which client is attached right now,
+so re-attaching a session from a different terminal is reflected in the next notification;
+outside tmux it walks the process ancestry to the owning app (iTerm2, Zed, Terminal, …).
+
+Then add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -88,29 +109,40 @@ Add to `~/.claude/settings.json`:
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "echo \"$ITERM_SESSION_ID\" > /tmp/claude-session-id-$PPID; echo \"$TERM_PROGRAM\" > /tmp/claude-term-program-$PPID; T=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' '); case \"$T\" in ttys*) echo \"/dev/$T\" > /tmp/claude-tty-$PPID;; esac; if [ -n \"$TMUX\" ]; then tmux display-message -p '#{window_id}' > /tmp/claude-tmux-winid-$PPID; fi"
+            "command": "~/.claude/hooks/claude-notifier-ctx.sh $PPID >/dev/null 2>&1; exit 0",
+            "type": "command"
           }
         ]
       }
     ],
     "Notification": [
       {
-        "matcher": "",
         "hooks": [
           {
-            "type": "command",
-            "command": "IN=$(cat) && MSG=$(echo \"$IN\" | jq -r '.message // \"Claude Code is ready\"') && NTYPE=$(echo \"$IN\" | jq -r '.notification_type // \"\"') && STATUS=$(case \"$NTYPE\" in (permission_prompt) echo review;; (idle_prompt) echo waiting;; (auth_success) echo done;; (*) echo review;; esac) && TRANSCRIPT=$(echo \"$IN\" | jq -r '.transcript_path // \"\"') && AWAY=$(cat \"$TRANSCRIPT\" 2>/dev/null | jq -rs '([.[] | select(.type==\"system\" and .subtype==\"away_summary\") | .content] | last // \"\") | .[0:1000]' 2>/dev/null | tr '\\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && TITLE=$(cat \"$TRANSCRIPT\" 2>/dev/null | jq -rs '[.[] | select(.type==\"ai-title\") | .aiTitle] | last // \"\"' 2>/dev/null | tr '\\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && SRC=alert && if [ -n \"$AWAY\" ]; then MSG=\"$AWAY\"; SRC=recap; elif [ -n \"$TITLE\" ]; then MSG=\"$TITLE\"; SRC=title; fi && SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null || echo '') && TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null || echo '') && TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null || echo '') && TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null || echo \"$TERM_PROGRAM\") && TAPP=$(case \"$TPROG\" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac) && PROJECT=$(basename \"$(git -C \"$PWD\" rev-parse --show-toplevel 2>/dev/null || echo \"$PWD\")\") && MSG_ENC=$(python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$MSG\") && TITLE_ENC=$(python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$PROJECT\") && TWID_ENC=$(python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$TWID\") && TTY_ENC=$(python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$TTY\") && open -g \"claude-notifier://notify?title=$TITLE_ENC&message=$MSG_ENC&terminal=$TAPP&session=$SID&tmux_window_id=$TWID_ENC&tty=$TTY_ENC&status=$STATUS&source=$SRC\""
+            "command": "IN=$(cat) && MSG=$(echo \"$IN\" | jq -r '.message // \"Claude Code is ready\"') && NTYPE=$(echo \"$IN\" | jq -r '.notification_type // \"\"') && STATUS=$(case \"$NTYPE\" in (permission_prompt) echo review;; (idle_prompt) echo waiting;; (auth_success) echo done;; (*) echo review;; esac) && TRANSCRIPT=$(echo \"$IN\" | jq -r '.transcript_path // \"\"') && AWAY=$(cat \"$TRANSCRIPT\" 2>/dev/null | jq -rs '([.[] | select(.type==\"system\" and .subtype==\"away_summary\") | .content] | last // \"\") | .[0:1000]' 2>/dev/null | tr '\\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && TITLE=$(cat \"$TRANSCRIPT\" 2>/dev/null | jq -rs '[.[] | select(.type==\"ai-title\") | .aiTitle] | last // \"\"' 2>/dev/null | tr '\\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && SRC=alert && if [ -n \"$AWAY\" ]; then MSG=\"$AWAY\"; SRC=recap; elif [ -n \"$TITLE\" ]; then MSG=\"$TITLE\"; SRC=title; fi; eval \"$(~/.claude/hooks/claude-notifier-ctx.sh $PPID 2>/dev/null)\"; TOP=$(git -C \"$PWD\" rev-parse --show-toplevel 2>/dev/null || echo \"$PWD\"); PROJECT=$(basename \"$TOP\"); ENC(){ python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?title=$(ENC \"$PROJECT\")&message=$(ENC \"$MSG\")&terminal=$CN_TERMINAL&terminal_name=$(ENC \"$CN_NAME\")&bundle=$(ENC \"$CN_BUNDLE\")&session=$(ENC \"$CN_SESSION\")&tmux_window_id=$(ENC \"$CN_TMUX_WINID\")&tmux_socket=$(ENC \"$CN_TMUX_SOCKET\")&tmux_session=$(ENC \"$CN_TMUX_SESSION\")&tty=$(ENC \"$CN_TTY\")&workdir=$(ENC \"$TOP\")&status=$STATUS&source=$SRC\"",
+            "type": "command"
           }
-        ]
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "[ -f /tmp/claude-notifier-remote-approvals ] || exit 0; IN=$(cat); TOOL=$(echo \"$IN\" | jq -r '.tool_name // \"Bash\"'); CMD=$(echo \"$IN\" | jq -r '.tool_input.command // .tool_input.file_path // \"\"' | tr '\\n' ' ' | cut -c1-200); REQ=\"$PPID-$$-$(date +%s)\"; eval \"$(~/.claude/hooks/claude-notifier-ctx.sh $PPID 2>/dev/null)\"; TOP=$(git -C \"$PWD\" rev-parse --show-toplevel 2>/dev/null || echo \"$PWD\"); PROJECT=$(basename \"$TOP\"); ENC(){ python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; rm -f \"/tmp/claude-notifier-decision-$REQ.json\"; open -g \"claude-notifier://notify?title=$(ENC \"$PROJECT\")&message=$(ENC \"$TOOL: $CMD\")&terminal=$CN_TERMINAL&terminal_name=$(ENC \"$CN_NAME\")&bundle=$(ENC \"$CN_BUNDLE\")&session=$(ENC \"$CN_SESSION\")&tmux_window_id=$(ENC \"$CN_TMUX_WINID\")&tmux_socket=$(ENC \"$CN_TMUX_SOCKET\")&tmux_session=$(ENC \"$CN_TMUX_SESSION\")&tty=$(ENC \"$CN_TTY\")&workdir=$(ENC \"$TOP\")&status=review&tool=$(ENC \"$TOOL\")&decision=$REQ\"; D=\"\"; for i in $(seq 1 120); do if [ -f \"/tmp/claude-notifier-decision-$REQ.json\" ]; then D=$(jq -r '.decision // \"\"' \"/tmp/claude-notifier-decision-$REQ.json\" 2>/dev/null); rm -f \"/tmp/claude-notifier-decision-$REQ.json\"; break; fi; sleep 0.5; done; [ \"$D\" = \"allow\" ] && printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"Approved in claude-notifier\"}}'; [ \"$D\" = \"deny\" ] && printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Denied in claude-notifier\"}}'; exit 0",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null||echo ''); TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null||echo \"$TERM_PROGRAM\"); TAPP=$(case \"$TPROG\" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac); PROJECT=$(basename \"$(git -C \"$PWD\" rev-parse --show-toplevel 2>/dev/null||echo \"$PWD\")\"); ENC(){ python3 -c \"import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?title=$(ENC \"$PROJECT\")&terminal=$TAPP&session=$SID&tmux_window_id=$(ENC \"$TWID\")&tty=$(ENC \"$TTY\")&status=running&thinking=start\""
+            "command": "eval \"$(~/.claude/hooks/claude-notifier-ctx.sh $PPID 2>/dev/null)\"; TOP=$(git -C \"$PWD\" rev-parse --show-toplevel 2>/dev/null || echo \"$PWD\"); PROJECT=$(basename \"$TOP\"); ENC(){ python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?title=$(ENC \"$PROJECT\")&terminal=$CN_TERMINAL&terminal_name=$(ENC \"$CN_NAME\")&bundle=$(ENC \"$CN_BUNDLE\")&session=$(ENC \"$CN_SESSION\")&tmux_window_id=$(ENC \"$CN_TMUX_WINID\")&tmux_socket=$(ENC \"$CN_TMUX_SOCKET\")&tmux_session=$(ENC \"$CN_TMUX_SESSION\")&tty=$(ENC \"$CN_TTY\")&workdir=$(ENC \"$TOP\")&status=running&thinking=start\"",
+            "type": "command"
           }
         ]
       }
@@ -119,8 +151,8 @@ Add to `~/.claude/settings.json`:
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); ENC(){ python3 -c \"import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?session=$SID&tmux_window_id=$(ENC \"$TWID\")&thinking=stop\""
+            "command": "eval \"$(~/.claude/hooks/claude-notifier-ctx.sh $PPID 2>/dev/null)\"; ENC(){ python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?session=$(ENC \"$CN_SESSION\")&tmux_window_id=$(ENC \"$CN_TMUX_WINID\")&thinking=stop\"",
+            "type": "command"
           }
         ]
       }
@@ -129,8 +161,8 @@ Add to `~/.claude/settings.json`:
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); ENC(){ python3 -c \"import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?session=$SID&tmux_window_id=$(ENC \"$TWID\")&thinking=stop\""
+            "command": "eval \"$(~/.claude/hooks/claude-notifier-ctx.sh $PPID 2>/dev/null)\"; ENC(){ python3 -c \"import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))\" \"$1\"; }; open -g \"claude-notifier://notify?session=$(ENC \"$CN_SESSION\")&tmux_window_id=$(ENC \"$CN_TMUX_WINID\")&thinking=stop\"",
+            "type": "command"
           }
         ]
       }
@@ -260,8 +292,15 @@ Clicking a notification row, or the native banner, activates the originating ter
 | iTerm2 (tmux) | Resolves tmux window to iTerm2 tab via ListSessions API, then activates |
 | VS Code | Activates VS Code |
 | Terminal.app | Selects the matching tab by `tty` (first focus prompts for Automation permission), then activates Terminal.app |
+| Zed | Focuses the workspace window for the notification's `workdir` via the `zed` CLI (reopens it if closed), then activates the app |
 | Ghostty / WezTerm / kitty / Alacritty / Warp | Activates the app (app-level focus; no tab focus) |
-| Other | Notification only |
+| Other | Activates by `bundle` id when the hook provided one; otherwise notification only |
+
+**tmux re-attach:** when the notification carries `tmux_socket` + `tmux_session`, the click asks
+the tmux server which client is attached *at that moment* (most recently active one when several
+are) and focuses that terminal, so a session re-attached from a different terminal after the
+notification fired is still focused correctly. With no client attached, the terminal recorded at
+notification time is used.
 
 ## Architecture
 

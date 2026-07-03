@@ -562,44 +562,164 @@ let terminalBundleIDs: [String: String] = [
     "kitty": "net.kovidgoyal.kitty",
     "alacritty": "org.alacritty",
     "warp": "dev.warp.Warp-Stable",
+    "zed": "dev.zed.Zed",
 ]
 
 let terminalDisplayNames: [String: String] = [
     "iterm2": "iTerm", "vscode": "VS Code", "terminal": "Terminal",
     "ghostty": "Ghostty", "wezterm": "WezTerm", "kitty": "kitty",
-    "alacritty": "Alacritty", "warp": "Warp",
+    "alacritty": "Alacritty", "warp": "Warp", "zed": "Zed",
 ]
+
+/// Map a terminal app bundle name (from a process-ancestry walk) to its terminal token.
+let appNameToTerminal: [String: String] = [
+    "iTerm.app": "iterm2", "Terminal.app": "terminal", "Zed.app": "zed",
+    "Zed Preview.app": "zed", "Zed Nightly.app": "zed", "Ghostty.app": "ghostty",
+    "WezTerm.app": "wezterm", "kitty.app": "kitty", "Alacritty.app": "alacritty",
+    "Warp.app": "warp", "Visual Studio Code.app": "vscode",
+]
+
+// MARK: - Click-time tmux attachment resolution
+
+/// Run a short-lived helper process and return its stdout, or nil on failure.
+private func runCommand(_ path: String, _ args: [String]) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+private func tmuxBinaryPath() -> String? {
+    for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+    where FileManager.default.isExecutableFile(atPath: p) { return p }
+    return nil
+}
+
+/// Walk a pid's process ancestry to the .app bundle that owns it. Helper daemons
+/// (e.g. iTermServer) don't match ".app/Contents/MacOS/" so the walk passes them.
+private func appBundlePath(forPid pid: Int) -> String? {
+    var p = pid
+    for _ in 0..<20 {
+        guard p > 1,
+              let out = runCommand("/bin/ps", ["-o", "ppid=,comm=", "-p", String(p)]) else { return nil }
+        let line = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let space = line.firstIndex(where: { $0 == " " || $0 == "\t" }) else { return nil }
+        guard let ppid = Int(line[..<space]) else { return nil }
+        let comm = line[line.index(after: space)...].trimmingCharacters(in: .whitespaces)
+        if let r = comm.range(of: ".app/Contents/MacOS/") {
+            return String(comm[..<r.lowerBound]) + ".app"
+        }
+        p = ppid
+    }
+    return nil
+}
+
+/// Focus the Zed workspace for a directory via the zed CLI: an already-open
+/// workspace window is reused and raised; a closed one is reopened. Falls back
+/// silently (app-level activation still happens) when the CLI or dir is missing.
+func zedOpenWorkspace(_ workdir: String) {
+    let fm = FileManager.default
+    var isDir: ObjCBool = false
+    guard fm.fileExists(atPath: workdir, isDirectory: &isDir), isDir.boolValue else { return }
+    var candidates = ["/opt/homebrew/bin/zed", "/usr/local/bin/zed"]
+    if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "dev.zed.Zed") {
+        candidates.append(appURL.appendingPathComponent("Contents/MacOS/cli").path)
+    }
+    for cli in candidates where fm.isExecutableFile(atPath: cli) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cli)
+        p.arguments = [workdir]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        if (try? p.run()) != nil { return }
+    }
+}
+
+/// Ask the tmux server which terminal app is attached to the session RIGHT NOW
+/// (the most recently active client when several are). Returns nil when the
+/// server is gone, the session is detached, or the ancestry walk fails —
+/// callers then fall back to the terminal recorded at notification time.
+func resolveTmuxAttachment(socket: String, session: String) -> (terminal: String, bundle: String?)? {
+    guard let tmux = tmuxBinaryPath(),
+          let out = runCommand(tmux, ["-S", socket, "list-clients", "-t", session,
+                                      "-F", "#{client_activity} #{client_pid}"]) else { return nil }
+    let clientPid = out.split(separator: "\n")
+        .compactMap { line -> (Int, Int)? in
+            let f = line.split(separator: " ")
+            guard f.count == 2, let act = Int(f[0]), let pid = Int(f[1]) else { return nil }
+            return (act, pid)
+        }
+        .max { $0.0 < $1.0 }?.1
+    guard let clientPid = clientPid,
+          let appPath = appBundlePath(forPid: clientPid) else { return nil }
+    let appName = (appPath as NSString).lastPathComponent
+    let terminal = appNameToTerminal[appName] ?? "unknown"
+    let bundle = Bundle(path: appPath)?.bundleIdentifier ?? terminalBundleIDs[terminal]
+    guard terminal != "unknown" || bundle != nil else { return nil }
+    return (terminal, bundle)
+}
 
 // MARK: - Claude Code hook commands (used by the one-command installer)
 
-/// SessionStart hook: capture the iTerm2 session id, terminal program, tty, and tmux window id.
-let sessionStartHookCommand = #"echo "$ITERM_SESSION_ID" > /tmp/claude-session-id-$PPID; echo "$TERM_PROGRAM" > /tmp/claude-term-program-$PPID; T=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' '); case "$T" in ttys*) echo "/dev/$T" > /tmp/claude-tty-$PPID;; esac; if [ -n "$TMUX" ]; then tmux display-message -p '#{window_id}' > /tmp/claude-tmux-winid-$PPID; fi"#
+/// Shell fragment shared by all hooks: resolve the terminal context (CN_* vars) for this
+/// Claude process at event time via the ctx script (see hooks/claude-notifier-ctx.sh).
+let ctxScriptInstallPath = "~/.claude/hooks/claude-notifier-ctx.sh"
+private let ctxEval = #"eval "$(~/.claude/hooks/claude-notifier-ctx.sh $PPID 2>/dev/null)""#
+/// URL query fragment carrying the resolved context (assumes ENC(), CN_* and TOP are defined).
+private let ctxQuery = #"terminal=$CN_TERMINAL&terminal_name=$(ENC "$CN_NAME")&bundle=$(ENC "$CN_BUNDLE")&session=$(ENC "$CN_SESSION")&tmux_window_id=$(ENC "$CN_TMUX_WINID")&tmux_socket=$(ENC "$CN_TMUX_SOCKET")&tmux_session=$(ENC "$CN_TMUX_SESSION")&tty=$(ENC "$CN_TTY")&workdir=$(ENC "$TOP")"#
 
-/// Notification hook: derive the message (recap → title → alert), status, and terminal, then
-/// open the claude-notifier URL scheme. Mirrors the documented hook in README.md.
-let notificationHookCommand = #"IN=$(cat) && MSG=$(echo "$IN" | jq -r '.message // "Claude Code is ready"') && NTYPE=$(echo "$IN" | jq -r '.notification_type // ""') && STATUS=$(case "$NTYPE" in (permission_prompt) echo review;; (idle_prompt) echo waiting;; (auth_success) echo done;; (*) echo review;; esac) && TRANSCRIPT=$(echo "$IN" | jq -r '.transcript_path // ""') && AWAY=$(cat "$TRANSCRIPT" 2>/dev/null | jq -rs '([.[] | select(.type=="system" and .subtype=="away_summary") | .content] | last // "") | .[0:1000]' 2>/dev/null | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && TITLE=$(cat "$TRANSCRIPT" 2>/dev/null | jq -rs '[.[] | select(.type=="ai-title") | .aiTitle] | last // ""' 2>/dev/null | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && SRC=alert && if [ -n "$AWAY" ]; then MSG="$AWAY"; SRC=recap; elif [ -n "$TITLE" ]; then MSG="$TITLE"; SRC=title; fi && SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null || echo '') && TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null || echo '') && TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null || echo '') && TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null || echo "$TERM_PROGRAM") && TAPP=$(case "$TPROG" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac) && PROJECT=$(basename "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")") && MSG_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$MSG") && TITLE_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$PROJECT") && TWID_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TWID") && TTY_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TTY") && open -g "claude-notifier://notify?title=$TITLE_ENC&message=$MSG_ENC&terminal=$TAPP&session=$SID&tmux_window_id=$TWID_ENC&tty=$TTY_ENC&status=$STATUS&source=$SRC""#
+/// SessionStart hook: warm the ctx cache so a later detached-tmux fallback has data.
+let sessionStartHookCommand = #"~/.claude/hooks/claude-notifier-ctx.sh $PPID >/dev/null 2>&1; exit 0"#
+
+/// Notification hook: derive the message (recap → title → alert) and status, resolve the
+/// terminal context live via the ctx script, then open the claude-notifier URL scheme.
+/// Mirrors the documented hook in README.md.
+let notificationHookCommand = #"IN=$(cat) && MSG=$(echo "$IN" | jq -r '.message // "Claude Code is ready"') && NTYPE=$(echo "$IN" | jq -r '.notification_type // ""') && STATUS=$(case "$NTYPE" in (permission_prompt) echo review;; (idle_prompt) echo waiting;; (auth_success) echo done;; (*) echo review;; esac) && TRANSCRIPT=$(echo "$IN" | jq -r '.transcript_path // ""') && AWAY=$(cat "$TRANSCRIPT" 2>/dev/null | jq -rs '([.[] | select(.type=="system" and .subtype=="away_summary") | .content] | last // "") | .[0:1000]' 2>/dev/null | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && TITLE=$(cat "$TRANSCRIPT" 2>/dev/null | jq -rs '[.[] | select(.type=="ai-title") | .aiTitle] | last // ""' 2>/dev/null | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') && SRC=alert && if [ -n "$AWAY" ]; then MSG="$AWAY"; SRC=recap; elif [ -n "$TITLE" ]; then MSG="$TITLE"; SRC=title; fi; "# + ctxEval + #"; TOP=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD"); PROJECT=$(basename "$TOP"); ENC(){ python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$1"; }; open -g "claude-notifier://notify?title=$(ENC "$PROJECT")&message=$(ENC "$MSG")&"# + ctxQuery + #"&status=$STATUS&source=$SRC""#
 
 /// Optional PreToolUse approval hook (matcher: Bash). A no-op unless Remote Approvals is on
 /// (the flag file exists), in which case it notifies, waits up to ~60s for an Approve/Deny from
 /// the inbox, and returns the matching permissionDecision; on timeout it defers to the normal prompt.
-let approvalHookCommand = ##"[ -f /tmp/claude-notifier-remote-approvals ] || exit 0; IN=$(cat); TOOL=$(echo "$IN" | jq -r '.tool_name // "Bash"'); CMD=$(echo "$IN" | jq -r '.tool_input.command // .tool_input.file_path // ""' | tr '\n' ' ' | cut -c1-200); REQ="$PPID-$$-$(date +%s)"; SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null || echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null || echo ''); TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null || echo ''); TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null || echo "$TERM_PROGRAM"); TAPP=$(case "$TPROG" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac); PROJECT=$(basename "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"); ENC(){ python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$1"; }; rm -f "/tmp/claude-notifier-decision-$REQ.json"; open -g "claude-notifier://notify?title=$(ENC "$PROJECT")&message=$(ENC "$TOOL: $CMD")&terminal=$TAPP&session=$SID&tmux_window_id=$(ENC "$TWID")&tty=$(ENC "$TTY")&status=review&tool=$(ENC "$TOOL")&decision=$REQ"; D=""; for i in $(seq 1 120); do if [ -f "/tmp/claude-notifier-decision-$REQ.json" ]; then D=$(jq -r '.decision // ""' "/tmp/claude-notifier-decision-$REQ.json" 2>/dev/null); rm -f "/tmp/claude-notifier-decision-$REQ.json"; break; fi; sleep 0.5; done; [ "$D" = "allow" ] && printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"Approved in claude-notifier"}}'; [ "$D" = "deny" ] && printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Denied in claude-notifier"}}'; exit 0"##
+let approvalHookCommand = ##"[ -f /tmp/claude-notifier-remote-approvals ] || exit 0; IN=$(cat); TOOL=$(echo "$IN" | jq -r '.tool_name // "Bash"'); CMD=$(echo "$IN" | jq -r '.tool_input.command // .tool_input.file_path // ""' | tr '\n' ' ' | cut -c1-200); REQ="$PPID-$$-$(date +%s)"; "## + ctxEval + ##"; TOP=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD"); PROJECT=$(basename "$TOP"); ENC(){ python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$1"; }; rm -f "/tmp/claude-notifier-decision-$REQ.json"; open -g "claude-notifier://notify?title=$(ENC "$PROJECT")&message=$(ENC "$TOOL: $CMD")&"## + ctxQuery + ##"&status=review&tool=$(ENC "$TOOL")&decision=$REQ"; D=""; for i in $(seq 1 120); do if [ -f "/tmp/claude-notifier-decision-$REQ.json" ]; then D=$(jq -r '.decision // ""' "/tmp/claude-notifier-decision-$REQ.json" 2>/dev/null); rm -f "/tmp/claude-notifier-decision-$REQ.json"; break; fi; sleep 0.5; done; [ "$D" = "allow" ] && printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"Approved in claude-notifier"}}'; [ "$D" = "deny" ] && printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Denied in claude-notifier"}}'; exit 0"##
 
 /// UserPromptSubmit hook: light up the "thinking" (Claude is working) state for this session the
 /// moment a prompt is submitted. Silent, reuses the context captured at SessionStart. Kept short
 /// because UserPromptSubmit has a tighter 30s timeout.
-let thinkingStartHookCommand = #"SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); TTY=$(cat /tmp/claude-tty-$PPID 2>/dev/null||echo ''); TPROG=$(cat /tmp/claude-term-program-$PPID 2>/dev/null||echo "$TERM_PROGRAM"); TAPP=$(case "$TPROG" in (iTerm.app) echo iterm2;; (Apple_Terminal) echo terminal;; (vscode) echo vscode;; (ghostty) echo ghostty;; (WezTerm) echo wezterm;; (WarpTerminal) echo warp;; (*) echo unknown;; esac); PROJECT=$(basename "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null||echo "$PWD")"); ENC(){ python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }; open -g "claude-notifier://notify?title=$(ENC "$PROJECT")&terminal=$TAPP&session=$SID&tmux_window_id=$(ENC "$TWID")&tty=$(ENC "$TTY")&status=running&thinking=start""#
+let thinkingStartHookCommand = #""# + ctxEval + #"; TOP=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD"); PROJECT=$(basename "$TOP"); ENC(){ python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }; open -g "claude-notifier://notify?title=$(ENC "$PROJECT")&"# + ctxQuery + #"&status=running&thinking=start""#
 
 /// Stop / StopFailure hook: clear this session's "thinking" state when the turn ends. Only clears
 /// a still-thinking row; a real notification that arrived mid-turn is left intact.
-let thinkingStopHookCommand = #"SID=$(cat /tmp/claude-session-id-$PPID 2>/dev/null||echo ''); TWID=$(cat /tmp/claude-tmux-winid-$PPID 2>/dev/null||echo ''); ENC(){ python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }; open -g "claude-notifier://notify?session=$SID&tmux_window_id=$(ENC "$TWID")&thinking=stop""#
+let thinkingStopHookCommand = #""# + ctxEval + #"; ENC(){ python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }; open -g "claude-notifier://notify?session=$(ENC "$CN_SESSION")&tmux_window_id=$(ENC "$CN_TMUX_WINID")&thinking=stop""#
 
 func focusTerminal(terminalType: String, itermSession: String?, tmuxWindowID: String?,
-                   bundle: String? = nil, tty: String? = nil) {
+                   bundle: String? = nil, tty: String? = nil,
+                   tmuxSocket: String? = nil, tmuxSession: String? = nil,
+                   workdir: String? = nil) {
     var terminalType = terminalType
+    var bundle = bundle
+    // A tmux session may have been re-attached from a different terminal since the
+    // notification fired; when the hook told us where the session lives, ask the tmux
+    // server which terminal is attached NOW and follow that instead of the stored value.
+    if let sock = tmuxSocket, let ses = tmuxSession, !sock.isEmpty, !ses.isEmpty,
+       let current = resolveTmuxAttachment(socket: sock, session: ses) {
+        terminalType = current.terminal
+        if let b = current.bundle { bundle = b }
+    }
     // tmux sessions report terminal=unknown but still carry an iTerm session id (w<N>t<N>p<N>:UUID).
     // Normalize so existing rows stored as "unknown" still focus the iTerm2 tab/tmux window on click.
     if terminalType == "unknown", let s = itermSession, extractSessionUUID(s) != s {
         terminalType = "iterm2"
+    }
+    // Zed: workspace-level focus via the zed CLI (raises the window for that project),
+    // then fall through to app-level activation below as insurance.
+    if terminalType == "zed", let wd = workdir, !wd.isEmpty {
+        zedOpenWorkspace(wd)
     }
     if terminalType == "iterm2" {
         // 1) tmux integration → ListSessions to find matching tab, then Activate
@@ -976,13 +1096,17 @@ struct NotificationItem: Codable {
     var decision: String? = nil // pending approval request id; row shows Approve/Deny while unread
     var sound: String = ""    // resolved sound name; drives the row's left SF Symbol icon
     var thinking: Bool = false // live "Claude is working" state: silent, shows a spinner, not counted as unread
+    var tmuxSocket: String? = nil  // tmux server socket path, for click-time re-resolution
+    var tmuxSession: String? = nil // tmux session id ($N), for click-time re-resolution
+    var workdir: String? = nil     // project root, for workspace-level focus (Zed)
 
     init(id: String, sessionUUID: String?, tabId: String?, terminal: String,
          terminalName: String?, rawSession: String?, tmux: String?, shortcut: String?,
          title: String, message: String, status: NotifStatus, date: Date, read: Bool,
          count: Int = 1, source: String? = nil, bundle: String? = nil, escalated: Bool = false,
          tool: String? = nil, tty: String? = nil, decision: String? = nil, sound: String = "",
-         thinking: Bool = false) {
+         thinking: Bool = false, tmuxSocket: String? = nil, tmuxSession: String? = nil,
+         workdir: String? = nil) {
         self.id = id; self.sessionUUID = sessionUUID; self.tabId = tabId
         self.terminal = terminal; self.terminalName = terminalName
         self.rawSession = rawSession; self.tmux = tmux; self.shortcut = shortcut
@@ -990,12 +1114,14 @@ struct NotificationItem: Codable {
         self.date = date; self.read = read; self.count = count
         self.source = source; self.bundle = bundle; self.escalated = escalated
         self.tool = tool; self.tty = tty; self.decision = decision; self.sound = sound
-        self.thinking = thinking
+        self.thinking = thinking; self.tmuxSocket = tmuxSocket; self.tmuxSession = tmuxSession
+        self.workdir = workdir
     }
 
     enum CodingKeys: String, CodingKey {
         case id, sessionUUID, tabId, terminal, terminalName, rawSession, tmux, shortcut
         case title, message, status, date, read, count, source, bundle, escalated, tool, tty, decision, sound, thinking
+        case tmuxSocket, tmuxSession, workdir
     }
 
     init(from decoder: Decoder) throws {
@@ -1022,6 +1148,9 @@ struct NotificationItem: Codable {
         decision = try c.decodeIfPresent(String.self, forKey: .decision)
         sound = (try c.decodeIfPresent(String.self, forKey: .sound)) ?? ""
         thinking = (try c.decodeIfPresent(Bool.self, forKey: .thinking)) ?? false
+        tmuxSocket = try c.decodeIfPresent(String.self, forKey: .tmuxSocket)
+        tmuxSession = try c.decodeIfPresent(String.self, forKey: .tmuxSession)
+        workdir = try c.decodeIfPresent(String.self, forKey: .workdir)
     }
 }
 
@@ -1893,7 +2022,7 @@ final class InboxViewController: NSViewController, NSSearchFieldDelegate {
 
 class NotificationDelegate: NSObject, NSUserNotificationCenterDelegate {
     /// Called when the user clicks a native banner: (inbox id, terminal, session, tmux, bundle, tty).
-    var onActivate: ((String?, String, String?, String?, String?, String?) -> Void)?
+    var onActivate: ((String?, String, String?, String?, String?, String?, String?, String?, String?) -> Void)?
 
     func userNotificationCenter(
         _ center: NSUserNotificationCenter,
@@ -1914,7 +2043,10 @@ class NotificationDelegate: NSObject, NSUserNotificationCenterDelegate {
             userInfo["itermSession"] as? String,
             userInfo["tmuxWindowID"] as? String,
             userInfo["bundle"] as? String,
-            userInfo["tty"] as? String
+            userInfo["tty"] as? String,
+            userInfo["tmuxSocket"] as? String,
+            userInfo["tmuxSession"] as? String,
+            userInfo["workdir"] as? String
         )
     }
 }
@@ -1947,8 +2079,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var activeTabId: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        notificationDelegate.onActivate = { [weak self] id, term, sess, tmux, bundle, tty in
-            focusTerminal(terminalType: term, itermSession: sess, tmuxWindowID: tmux, bundle: bundle, tty: tty)
+        notificationDelegate.onActivate = { [weak self] id, term, sess, tmux, bundle, tty, tmuxSocket, tmuxSession, workdir in
+            focusTerminal(terminalType: term, itermSession: sess, tmuxWindowID: tmux, bundle: bundle, tty: tty,
+                          tmuxSocket: tmuxSocket, tmuxSession: tmuxSession, workdir: workdir)
             if let id = id { self?.store.markRead(id: id) }
         }
         NSUserNotificationCenter.default.delegate = notificationDelegate
@@ -2147,7 +2280,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func focusAndRead(_ id: String) {
         if let item = store.items.first(where: { $0.id == id }) {
             focusTerminal(terminalType: item.terminal, itermSession: item.rawSession,
-                          tmuxWindowID: item.tmux, bundle: item.bundle, tty: item.tty)
+                          tmuxWindowID: item.tmux, bundle: item.bundle, tty: item.tty,
+                          tmuxSocket: item.tmuxSocket, tmuxSession: item.tmuxSession,
+                          workdir: item.workdir)
         }
         store.markRead(id: id)
     }
@@ -2527,6 +2662,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dir = home.appendingPathComponent(".claude", isDirectory: true)
         let url = dir.appendingPathComponent("settings.json")
 
+        // Install the shared context-resolver script the hook commands eval.
+        guard let ctxSource = Bundle.main.path(forResource: "claude-notifier-ctx", ofType: "sh") else {
+            showAlert(.warning, "Missing resource",
+                      "claude-notifier-ctx.sh was not found in the app bundle; rebuild the app.")
+            return
+        }
+        let hooksDir = dir.appendingPathComponent("hooks", isDirectory: true)
+        let ctxDest = hooksDir.appendingPathComponent("claude-notifier-ctx.sh")
+        do {
+            try FileManager.default.createDirectory(at: hooksDir, withIntermediateDirectories: true)
+            let data = try Data(contentsOf: URL(fileURLWithPath: ctxSource))
+            try data.write(to: ctxDest, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ctxDest.path)
+        } catch {
+            showAlert(.warning, "Failed to install \(ctxScriptInstallPath)", error.localizedDescription)
+            return
+        }
+
         var root: [String: Any] = [:]
         if let data = try? Data(contentsOf: url) {
             guard let obj = try? JSONSerialization.jsonObject(with: data),
@@ -2696,8 +2849,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let status = NotifStatus(param: params["status"])
 
-        let terminalName = terminalDisplayNames[terminal]
-        let bundle = terminalBundleIDs[terminal]
+        // The ctx-script hooks resolve name/bundle themselves (covers apps not in the
+        // built-in tables); older hooks omit these params and fall back to the tables.
+        let terminalName = params["terminal_name"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? terminalDisplayNames[terminal]
+        let bundle = params["bundle"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? terminalBundleIDs[terminal]
+        let tmuxSocket = params["tmux_socket"].flatMap { $0.isEmpty ? nil : $0 }
+        let tmuxSession = params["tmux_session"].flatMap { $0.isEmpty ? nil : $0 }
+        let workdir = params["workdir"].flatMap { $0.isEmpty ? nil : $0 }
         let tty = params["tty"].flatMap { $0.isEmpty ? nil : $0 }
         var shortcut: String?
         var tabId: String?
@@ -2727,7 +2887,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             presentBanner(id: id,
                           title: bannerTitle(project: projectName, terminalName: terminalName, shortcut: shortcut),
                           message: messageText, sound: soundName,
-                          terminal: terminal, session: sess, tmux: twID, bundle: bundle, tty: tty)
+                          terminal: terminal, session: sess, tmux: twID, bundle: bundle, tty: tty,
+                          tmuxSocket: tmuxSocket, tmuxSession: tmuxSession, workdir: workdir)
             forwardToWebhook(title: projectName, message: messageText, status: status,
                              source: params["source"].flatMap { $0.isEmpty ? nil : $0 })
         }
@@ -2753,7 +2914,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             tty: tty,
             decision: params["decision"].flatMap { $0.isEmpty ? nil : $0 },
             sound: soundName,
-            thinking: isThinking
+            thinking: isThinking,
+            tmuxSocket: tmuxSocket,
+            tmuxSession: tmuxSession,
+            workdir: workdir
         ), forceRead: isThinking ? false : focused)
         // Visual arrival cue is the Dock badge (updated via store.onChange → updateBadge);
         // no Dock bounce, which the user found too noisy.
@@ -2764,7 +2928,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// single place notifications accumulate. In "off" mode only the sound plays.
     private func presentBanner(id: String, title: String, message: String, sound: String,
                                terminal: String, session: String?, tmux: String?, bundle: String?,
-                               tty: String? = nil) {
+                               tty: String? = nil, tmuxSocket: String? = nil, tmuxSession: String? = nil,
+                               workdir: String? = nil) {
         let mode = currentBannerMode()
         if mode == "off" {
             if !sound.isEmpty { NSSound(named: NSSound.Name(sound))?.play() }
@@ -2781,6 +2946,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let tmux = tmux { userInfo["tmuxWindowID"] = tmux }
         if let bundle = bundle { userInfo["bundle"] = bundle }
         if let tty = tty { userInfo["tty"] = tty }
+        if let tmuxSocket = tmuxSocket { userInfo["tmuxSocket"] = tmuxSocket }
+        if let tmuxSession = tmuxSession { userInfo["tmuxSession"] = tmuxSession }
+        if let workdir = workdir { userInfo["workdir"] = workdir }
         notification.userInfo = userInfo
 
         let center = NSUserNotificationCenter.default

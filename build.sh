@@ -32,6 +32,9 @@ cp "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 cp "$SCRIPT_DIR/Resources/menubar_icon.png" "$RESOURCES_DIR/menubar_icon.png"
 cp "$SCRIPT_DIR/Resources/menubar_icon@2x.png" "$RESOURCES_DIR/menubar_icon@2x.png"
 
+echo "==> Copying hook scripts..."
+cp "$SCRIPT_DIR/hooks/claude-notifier-ctx.sh" "$RESOURCES_DIR/claude-notifier-ctx.sh"
+
 echo "==> Setting permissions..."
 chmod +x "$MACOS_DIR/claude-notifier"
 

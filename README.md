@@ -208,7 +208,8 @@ the project name, the terminal and tab shortcut, a relative time, and the messag
   back to the top with the latest message and shows a **×N** badge counting how many times it
   has pinged you, so you can tell it fired more than once.
 - Notifications stay in the list until you act on them or dismiss them; acted-on ones remain
-  as dimmed history. Switching to a notification's iTerm2 tab marks it read automatically.
+  as dimmed history. Switching to a notification's iTerm2 tab while iTerm2 is frontmost marks it
+  read automatically.
 - **Visual arrival cue (no sound needed):** the Dock icon and the menu-bar bell both show an
   unread-count badge that increments as notifications arrive and clears as you read them. The
   native banner (see **Banner modes** above) is an additional cue. Enable **Always on Top** to
@@ -279,7 +280,7 @@ corrupt file is moved aside automatically and the app starts with an empty inbox
 
 ### Quiet (focused) tab
 
-If a notification fires for the iTerm2 tab you are already looking at, it lands silently in the
+If a notification fires for the frontmost iTerm2 tab you are already looking at, it lands silently in the
 inbox as read history (no banner, no sound, no badge bump), since you are clearly already there.
 
 ## Click-to-Focus

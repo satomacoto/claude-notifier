@@ -2074,11 +2074,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var becameActiveBeforeSetup = false
 
     // Last-known active iTerm2 session/tab (from FocusMonitor), used to silence a banner/sound
-    // when a notification fires for the tab the user is already looking at.
+    // only when iTerm2 itself is frontmost and the user is actually looking at that tab.
     private var activeSessionUUID: String?
     private var activeTabId: String?
+    private var frontmostBundleID: String?
+
+    private func isIterm2Frontmost(_ bundleID: String? = nil) -> Bool {
+        (bundleID ?? frontmostBundleID) == terminalBundleIDs["iterm2"]
+    }
+
+    private func markVisibleItermNotificationsRead() {
+        guard isIterm2Frontmost() else { return }
+        if let tabId = activeTabId { store.markReadByActiveTab(tabId) }
+        if let sessionUUID = activeSessionUUID { store.markReadByActiveSession(sessionUUID) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(frontmostApplicationChanged(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+
         notificationDelegate.onActivate = { [weak self] id, term, sess, tmux, bundle, tty, tmuxSocket, tmuxSession, workdir in
             focusTerminal(terminalType: term, itermSession: sess, tmuxWindowID: tmux, bundle: bundle, tty: tty,
                           tmuxSocket: tmuxSocket, tmuxSession: tmuxSession, workdir: workdir)
@@ -2114,12 +2133,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // notification as read when the user switches to that tab (no click needed). Also
         // remember the active session/tab so a banner can be silenced for the focused tab.
         focusMonitor.onActiveSession = { [weak self] sid in
-            self?.activeSessionUUID = extractSessionUUID(sid)
-            self?.store.markReadByActiveSession(sid)
+            guard let self = self else { return }
+            self.activeSessionUUID = extractSessionUUID(sid)
+            if self.isIterm2Frontmost() { self.store.markReadByActiveSession(sid) }
         }
         focusMonitor.onActiveTab = { [weak self] tab in
-            self?.activeTabId = tab
-            self?.store.markReadByActiveTab(tab)
+            guard let self = self else { return }
+            self.activeTabId = tab
+            if self.isIterm2Frontmost() { self.store.markReadByActiveTab(tab) }
         }
         focusMonitor.onHealthChange = { [weak self] ok in
             self?.inboxVC.iterm2Connected = ok
@@ -2139,6 +2160,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // If the app became active during launch before the window existed (a crash-recovery
         // modal draining events), evaluate the auto-show now that setup is complete.
         if becameActiveBeforeSetup { autoShowUnlessLaunchedByURL() }
+    }
+
+    @objc private func frontmostApplicationChanged(_ notification: Notification) {
+        let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        frontmostBundleID = app?.bundleIdentifier
+        markVisibleItermNotificationsRead()
     }
 
     // MARK: Menu bar status item
@@ -2807,7 +2834,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard url.scheme == "claude-notifier" else { continue }
             switch url.host {
             case "notify":
-                deliverNotification(from: url)
+                deliverNotification(from: url, frontmostBundleID: previousApp?.bundleIdentifier)
             case "quit":
                 NSApp.terminate(nil)
             default:
@@ -2819,7 +2846,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         previousApp?.activate(options: [.activateIgnoringOtherApps])
     }
 
-    private func deliverNotification(from url: URL) {
+    private func deliverNotification(from url: URL, frontmostBundleID: String?) {
         let params = parseQueryParams(from: url)
         // The hook always includes session=/tmux_window_id=, often empty; treat "" as absent.
         let twID = params["tmux_window_id"].flatMap { $0.isEmpty ? nil : $0 }
@@ -2872,7 +2899,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // If the user is already looking at the originating iTerm2 tab/session, land the
         // notification silently as read history (no banner, no sound, no badge bump).
         var focused = false
-        if terminal == "iterm2" {
+        if terminal == "iterm2", isIterm2Frontmost(frontmostBundleID) {
             if twID != nil, let tb = tabId, tb == activeTabId {
                 focused = true
             } else if twID == nil, let s = sess, let active = activeSessionUUID,
